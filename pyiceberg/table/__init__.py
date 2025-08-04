@@ -66,6 +66,7 @@ from pyiceberg.expressions.visitors import (
     rewrite_not,
 )
 from pyiceberg.io import FileIO, load_file_io
+from pyiceberg.logger import get_logger
 from pyiceberg.manifest import (
     POSITIONAL_DELETE_SCHEMA,
     DataFile,
@@ -253,7 +254,7 @@ class TableProperties:
     MIN_SNAPSHOTS_TO_KEEP_DEFAULT = 1
 
 
-logger = getLogger(__name__)
+logger = get_logger(__name__)
 
 
 class Transaction:
@@ -802,7 +803,9 @@ class Transaction:
         def _before_attempt(state: RetryCallState):
             if state.attempt_number > 1:
                 namespace, table = self._table.name()
-                logger.debug(f"Refreshing metadata and operations for {namespace}.{table} and retrying transaction commit...")
+                logger.debug(
+                    f"({state.attempt_number - 1}) Refreshing metadata and operations for `{namespace}.{table}` and retrying transaction commit..."
+                )
                 self._table.refresh()
                 self._updates, self._requirements = (), ()
                 for op in self._snapshot_operations:
@@ -810,16 +813,12 @@ class Transaction:
                     self._apply(*op._commit())
             logger.debug(f"Committing transaction...")
 
-        def _after_error(state: RetryCallState):
-            logger.debug(f'Encountered CommitFailedException: "{state.outcome.exception()}"...')
-
         @wraps(self.commit_transaction)
         @retry(
             wait=wait_random_exponential(min=min_wait_ms / 1000, max=max_wait_ms / 1000),
             stop=stop_after_attempt(num_retries),
             retry=retry_if_exception_type(CommitFailedException),
             before=_before_attempt,
-            after=_after_error,
             reraise=True,
         )
         def _commit_transaction():
@@ -1502,7 +1501,7 @@ class TableScan(ABC):
         snapshot_id: Optional[int] = None,
         options: Properties = EMPTY_DICT,
         limit: Optional[int] = None,
-        bound_filter: Optional[BooleanExpression] = None
+        bound_filter: Optional[BooleanExpression] = None,
     ):
         self.table_metadata = table_metadata
         self.io = io

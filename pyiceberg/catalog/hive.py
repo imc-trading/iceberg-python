@@ -15,7 +15,6 @@
 #  specific language governing permissions and limitations
 #  under the License.
 import getpass
-import logging
 import socket
 import time
 from types import TracebackType
@@ -77,6 +76,7 @@ from pyiceberg.exceptions import (
     TableAlreadyExistsError,
     WaitingForLockException,
 )
+from pyiceberg.logger import get_logger
 from pyiceberg.partitioning import UNPARTITIONED_PARTITION_SPEC, PartitionSpec
 from pyiceberg.schema import Schema, SchemaVisitor, visit
 from pyiceberg.serializers import FromInputFile
@@ -136,7 +136,8 @@ DEFAULT_LOCK_CHECK_MIN_WAIT_TIME = 0.1  # 100 milliseconds
 DEFAULT_LOCK_CHECK_MAX_WAIT_TIME = 60  # 1 min
 DEFAULT_LOCK_CHECK_RETRIES = 4
 
-logger = logging.getLogger(__name__)
+
+logger = get_logger(__name__)
 
 
 class _HiveClient:
@@ -464,27 +465,28 @@ class HiveCatalog(MetastoreCatalog):
 
     def _wait_for_lock(self, database_name: str, table_name: str, lockid: int, open_client: Client) -> LockResponse:
         def _on_wait_for_lock_fail(state: RetryCallState) -> None:
-            raise WaitingForLockException(
-                f"Failed after {state.attempt_number} attempts to wait on lock for {database_name}.{table_name}"
-            )
+            msg = f"Failed after {state.attempt_number} attempts to wait on lock for `{database_name}.{table_name}`"
+            logger.debug(msg)
+            raise WaitingForLockException(msg)
 
         @retry(
             retry=retry_if_exception_type(WaitingForLockException),
             wait=wait_exponential(multiplier=2, min=self._lock_check_min_wait_time, max=self._lock_check_max_wait_time),
             stop=stop_after_attempt(self._lock_check_retries),
-            before=lambda state: logger.warning(f"({state.attempt_number}) Waiting on lock for {database_name}.{table_name}..."),
+            before=lambda state: logger.debug(f"({state.attempt_number}) Waiting on lock for `{database_name}.{table_name}`..."),
             retry_error_callback=_on_wait_for_lock_fail,
         )
         def _do_wait_for_lock() -> LockResponse:
             response: LockResponse = open_client.check_lock(CheckLockRequest(lockid=lockid))
             if response.state == LockState.ACQUIRED:
+                logger.debug("Acquired lock after waiting.")
                 return response
             elif response.state == LockState.WAITING:
-                msg = f"Waiting on lock for {database_name}.{table_name}..."
-                logger.warning(msg)
-                raise WaitingForLockException(msg)
+                raise WaitingForLockException()
             else:
-                raise CommitFailedException(f"Failed to check lock for {database_name}.{table_name}, state: {response.state}")
+                raise CommitFailedException(
+                    f"Failed to check lock for {database_name}.{table_name}, lock state: {response.state}"
+                )
 
         return _do_wait_for_lock()
 
@@ -511,13 +513,14 @@ class HiveCatalog(MetastoreCatalog):
         # https://github.com/apache/hive/blob/master/standalone-metastore/metastore-common/src/main/thrift/hive_metastore.thrift#L1232
         with self._client as open_client:
             lock: LockResponse = open_client.lock(self._create_lock_request(database_name, table_name))
-
             try:
                 if lock.state != LockState.ACQUIRED:
                     if lock.state == LockState.WAITING:
                         self._wait_for_lock(database_name, table_name, lock.lockid, open_client)
                     else:
-                        raise CommitFailedException(f"Failed to acquire lock for {table_identifier}, state: {lock.state}")
+                        raise CommitFailedException(f"Failed to acquire lock for {table_identifier}, lock state: {lock.state}")
+                else:
+                    logger.debug("Acquired lock on initial attempt.")
 
                 hive_table: Optional[HiveTable]
                 current_table: Optional[Table]
@@ -558,7 +561,7 @@ class HiveCatalog(MetastoreCatalog):
                     )
                     self._create_hive_table(open_client, hive_table)
             except WaitingForLockException as e:
-                raise CommitFailedException(f"Failed to acquire lock for {table_identifier}, state: {lock.state}") from e
+                raise CommitFailedException(f"Failed to acquire lock for {table_identifier}, lock state: {lock.state}") from e
             finally:
                 open_client.unlock(UnlockRequest(lockid=lock.lockid))
 
