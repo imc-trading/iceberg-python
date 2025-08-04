@@ -52,7 +52,7 @@ from hive_metastore.ttypes import (
 )
 from hive_metastore.ttypes import Database as HiveDatabase
 from hive_metastore.ttypes import Table as HiveTable
-from tenacity import RetryCallState, retry, retry_if_exception_type, stop_after_attempt, wait_exponential
+from tenacity import RetryCallState, retry, retry_if_exception_type, stop_after_attempt, wait_random_exponential
 from thrift.protocol import TBinaryProtocol
 from thrift.transport import TSocket, TTransport
 
@@ -132,9 +132,9 @@ HIVE_KERBEROS_AUTH_DEFAULT = False
 LOCK_CHECK_MIN_WAIT_TIME = "lock-check-min-wait-time"
 LOCK_CHECK_MAX_WAIT_TIME = "lock-check-max-wait-time"
 LOCK_CHECK_RETRIES = "lock-check-retries"
-DEFAULT_LOCK_CHECK_MIN_WAIT_TIME = 0.1  # 100 milliseconds
-DEFAULT_LOCK_CHECK_MAX_WAIT_TIME = 60  # 1 min
-DEFAULT_LOCK_CHECK_RETRIES = 4
+DEFAULT_LOCK_CHECK_MIN_WAIT_TIME = 1  # 1 second
+DEFAULT_LOCK_CHECK_MAX_WAIT_TIME = 5  # 5 seconds
+DEFAULT_LOCK_CHECK_RETRIES = 32
 
 
 logger = get_logger(__name__)
@@ -471,7 +471,7 @@ class HiveCatalog(MetastoreCatalog):
 
         @retry(
             retry=retry_if_exception_type(WaitingForLockException),
-            wait=wait_exponential(multiplier=2, min=self._lock_check_min_wait_time, max=self._lock_check_max_wait_time),
+            wait=wait_random_exponential(multiplier=2, min=self._lock_check_min_wait_time, max=self._lock_check_max_wait_time),
             stop=stop_after_attempt(self._lock_check_retries),
             before=lambda state: logger.debug(f"({state.attempt_number}) Waiting on lock for `{database_name}.{table_name}`..."),
             retry_error_callback=_on_wait_for_lock_fail,
