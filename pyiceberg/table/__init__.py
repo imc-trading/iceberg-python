@@ -271,15 +271,12 @@ class Transaction:
             table: The table that will be altered.
             autocommit: Option to automatically commit the changes when they are staged.
         """
+        self.table_metadata = table.metadata
         self._table = table
         self._autocommit = autocommit
         self._updates = ()
         self._requirements = ()
         self._snapshot_operations = ()
-
-    @property
-    def table_metadata(self) -> TableMetadata:
-        return self._table.metadata
 
     def __enter__(self) -> Transaction:
         """Start a transaction to update the table."""
@@ -306,7 +303,7 @@ class Transaction:
             if type(new_requirement) not in existing_requirements:
                 self._requirements = self._requirements + (new_requirement,)
 
-        self._table.metadata = update_table_metadata(self.table_metadata, updates)
+        self.table_metadata = update_table_metadata(self.table_metadata, updates)
 
         if self._autocommit:
             self.commit_transaction()
@@ -807,6 +804,7 @@ class Transaction:
                     f"({state.attempt_number - 1}) Refreshing metadata and operations for `{namespace}.{table}` and retrying transaction commit..."
                 )
                 self._table.refresh()
+                self.table_metadata = self._table.metadata
                 self._updates, self._requirements = (), ()
                 for op in self._snapshot_operations:
                     op._cleanup_commit_failure()
