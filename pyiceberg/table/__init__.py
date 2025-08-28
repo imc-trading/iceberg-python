@@ -811,13 +811,24 @@ class Transaction:
                     self._apply(*op._commit())
             logger.debug(f"Committing transaction...")
 
+        def _error_callback(state: RetryCallState):
+            msg = (
+                f"Failed to commit transaction after {state.attempt_number:,} attempts."
+                f" Try increasing the value of the `{COMMIT_NUM_RETRIES}` property on your table."
+            )
+            if state.outcome and (excp := state.outcome.exception()):
+                excp.args = (msg + "\n\n" + excp.args[0],)
+                raise excp
+
+            raise CommitFailedException(msg)
+
         @wraps(self.commit_transaction)
         @retry(
             wait=wait_random_exponential(min=min_wait_ms / 1000, max=max_wait_ms / 1000),
             stop=stop_after_attempt(num_retries),
             retry=retry_if_exception_type(CommitFailedException),
             before=_before_attempt,
-            reraise=True,
+            retry_error_callback=_error_callback,
         )
         def _commit_transaction():
             if len(self._updates) > 0:
