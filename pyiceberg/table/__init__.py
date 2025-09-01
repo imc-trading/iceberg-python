@@ -825,7 +825,7 @@ class Transaction:
         @wraps(self.commit_transaction)
         @retry(
             wait=wait_random_exponential(min=min_wait_ms / 1000, max=max_wait_ms / 1000),
-            stop=stop_after_attempt(num_retries),
+            stop=stop_after_attempt(num_retries + 1),
             retry=retry_if_exception_type(CommitFailedException),
             before=_before_attempt,
             retry_error_callback=_error_callback,

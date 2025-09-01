@@ -488,6 +488,9 @@ class HiveCatalog(MetastoreCatalog):
                     f"Failed to check lock for {database_name}.{table_name}, lock state: {response.state}"
                 )
 
+        if not self._lock_check_retries:
+            raise CommitFailedException(f"Lock was not acquired for commit and retries are set to `0`.")
+
         return _do_wait_for_lock()
 
     def commit_table(
