@@ -518,10 +518,7 @@ class HiveCatalog(MetastoreCatalog):
             lock: LockResponse = open_client.lock(self._create_lock_request(database_name, table_name))
             try:
                 if lock.state != LockState.ACQUIRED:
-                    if lock.state == LockState.WAITING:
-                        self._wait_for_lock(database_name, table_name, lock.lockid, open_client)
-                    else:
-                        raise CommitFailedException(f"Failed to acquire lock for {table_identifier}, lock state: {lock.state}")
+                    raise CommitFailedException(f"Failed to acquire lock for {table_identifier}, lock state: {lock.state}")
                 else:
                     logger.debug("Acquired lock on initial attempt.")
 
