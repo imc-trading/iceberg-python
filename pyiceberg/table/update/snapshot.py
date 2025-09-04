@@ -445,8 +445,10 @@ class _DeleteFiles(_SnapshotProducer["_DeleteFiles"]):
 
     def _cleanup_commit_failure(self) -> None:
         super()._cleanup_commit_failure()
-        del self.partition_filters
-        del self._compute_deletes
+        if "partition_filters" in self.__dict__:
+            del self.partition_filters
+        if "_compute_deletes" in self.__dict__:
+            del self._compute_deletes
 
     @property
     def rewrites_needed(self) -> bool:
