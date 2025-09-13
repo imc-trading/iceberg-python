@@ -104,7 +104,8 @@ class UpdateTableMetadata(ABC, Generic[U]):
         def commit_inner() -> None:
             self._transaction._apply(*self._commit())
 
-        return commit_inner()
+        commit_inner()
+        self._transaction._snapshot_operations += (self,)
 
     def _cleanup_commit_failure(self) -> None:
         """Prepare the snapshot producer to commit against the latest version of the table after it has been updated."""
