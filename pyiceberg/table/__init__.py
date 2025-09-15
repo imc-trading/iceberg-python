@@ -106,7 +106,6 @@ from pyiceberg.table.sorting import UNSORTED_SORT_ORDER, SortOrder
 from pyiceberg.table.update import (
     AddPartitionSpecUpdate,
     AddSchemaUpdate,
-    AddSnapshotUpdate,
     AddSortOrderUpdate,
     AssertCreate,
     AssertRefSnapshotId,
@@ -127,7 +126,6 @@ from pyiceberg.table.update import (
 )
 from pyiceberg.table.update.schema import UpdateSchema
 from pyiceberg.table.update.snapshot import (
-    _SnapshotProducer,
     ManageSnapshots,
     UpdateSnapshot,
     _FastAppendFiles,
@@ -161,6 +159,7 @@ if TYPE_CHECKING:
     from duckdb import DuckDBPyConnection
 
     from pyiceberg.catalog import Catalog
+    from pyiceberg.table.update import UpdateTableMetadata
 
 ALWAYS_TRUE = AlwaysTrue()
 DOWNCAST_NS_TIMESTAMP_TO_US_ON_WRITE = "downcast-ns-timestamp-to-us-on-write"
@@ -262,7 +261,7 @@ class Transaction:
     _autocommit: bool
     _updates: Tuple[TableUpdate, ...]
     _requirements: Tuple[TableRequirement, ...]
-    _snapshot_operations: Tuple[_SnapshotProducer, ...]
+    _snapshot_operations: Tuple[UpdateTableMetadata, ...]
 
     def __init__(self, table: Table, autocommit: bool = False):
         """Open a transaction to stage and commit changes to a table.
@@ -504,8 +503,6 @@ class Transaction:
                 for data_file in data_files:
                     append_files.append_data_file(data_file)
 
-        self._snapshot_operations += (append_files,)
-
     def dynamic_partition_overwrite(self, df: pa.Table, snapshot_properties: Dict[str, str] = EMPTY_DICT) -> None:
         """
         Shorthand for overwriting existing partitions with a PyArrow table.
@@ -560,8 +557,6 @@ class Transaction:
         with self._append_snapshot_producer(snapshot_properties, commit_uuid=append_snapshot_commit_uuid) as append_files:
             for data_file in data_files:
                 append_files.append_data_file(data_file)
-
-        self._snapshot_operations += (append_files,)
 
     def overwrite(
         self,
@@ -619,8 +614,6 @@ class Transaction:
                 )
                 for data_file in data_files:
                     append_files.append_data_file(data_file)
-
-        self._snapshot_operations += (append_files,)
 
     def delete(
         self,
@@ -716,8 +709,6 @@ class Transaction:
         if not delete_snapshot.files_affected and not delete_snapshot.rewrites_needed:
             warnings.warn("Delete operation did not match any records")
 
-        self._snapshot_operations += (delete_snapshot,)
-
     def add_files(
         self, file_paths: List[str], snapshot_properties: Dict[str, str] = EMPTY_DICT, check_duplicate_files: bool = True
     ) -> None:
@@ -753,8 +744,6 @@ class Transaction:
         with self.update_snapshot(snapshot_properties=snapshot_properties).fast_append() as append_snapshot:
             for data_file in data_files:
                 append_snapshot.append_data_file(data_file)
-
-        self._snapshot_operations += (append_snapshot,)
 
     def update_spec(self) -> UpdateSpec:
         """Create a new UpdateSpec to update the partitioning of the table.
