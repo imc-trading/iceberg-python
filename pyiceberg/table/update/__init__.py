@@ -25,7 +25,15 @@ from functools import singledispatch, wraps
 from typing import TYPE_CHECKING, Annotated, Any, Dict, Generic, List, Literal, Optional, Tuple, TypeVar, Union, cast
 
 from pydantic import Field, field_validator, model_validator
-from tenacity import RetryCallState, before_sleep_log, retry, retry_if_exception_type, stop_after_attempt, wait_random_exponential
+from tenacity import (
+    RetryCallState,
+    before_sleep_log,
+    retry,
+    retry_if_exception_type,
+    stop_after_attempt,
+    stop_after_delay,
+    wait_random_exponential,
+)
 
 from pyiceberg.exceptions import CommitFailedException
 from pyiceberg.partitioning import PARTITION_FIELD_ID_START, PartitionSpec
@@ -37,6 +45,8 @@ from pyiceberg.table.metadata import (
     COMMIT_MIN_RETRY_WAIT_MS_DEFAULT,
     COMMIT_NUM_RETRIES,
     COMMIT_NUM_RETRIES_DEFAULT,
+    COMMIT_RETRY_TOTAL_TIMEOUT_MS,
+    COMMIT_RETRY_TOTAL_TIMEOUT_MS_DEFAULT,
     SUPPORTED_TABLE_FORMAT_VERSION,
     TableMetadata,
     TableMetadataUtil,
@@ -86,6 +96,9 @@ class UpdateTableMetadata(ABC, Generic[U]):
             self._transaction.table_metadata.properties.get(COMMIT_MAX_RETRY_WAIT_MS, COMMIT_MAX_RETRY_WAIT_MS_DEFAULT)
         )
         num_retries = int(self._transaction.table_metadata.properties.get(COMMIT_NUM_RETRIES, COMMIT_NUM_RETRIES_DEFAULT))
+        timeout_ms = int(
+            self._transaction.table_metadata.properties.get(COMMIT_RETRY_TOTAL_TIMEOUT_MS, COMMIT_RETRY_TOTAL_TIMEOUT_MS_DEFAULT)
+        )
 
         def _before_commit_inner(state: RetryCallState) -> None:
             if state.attempt_number > 1:
@@ -94,7 +107,7 @@ class UpdateTableMetadata(ABC, Generic[U]):
         @wraps(self.commit)
         @retry(
             wait=wait_random_exponential(min=min_wait_ms / 1000, max=max_wait_ms / 1000),
-            stop=stop_after_attempt(num_retries),
+            stop=(stop_after_attempt(num_retries) | stop_after_delay(timeout_ms / 1000)),
             retry=retry_if_exception_type(CommitFailedException),
             before=_before_commit_inner,
             before_sleep=lambda state: logger.debug(

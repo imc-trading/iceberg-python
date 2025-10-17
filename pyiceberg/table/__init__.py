@@ -42,7 +42,7 @@ from typing import (
 
 from pydantic import Field
 from sortedcontainers import SortedList
-from tenacity import RetryCallState, retry, retry_if_exception_type, stop_after_attempt, wait_random_exponential
+from tenacity import RetryCallState, retry, retry_if_exception_type, stop_after_attempt, stop_after_delay, wait_random_exponential
 
 import pyiceberg.expressions.parser as parser
 from pyiceberg.exceptions import CommitFailedException
@@ -91,6 +91,8 @@ from pyiceberg.table.metadata import (
     COMMIT_MIN_RETRY_WAIT_MS_DEFAULT,
     COMMIT_NUM_RETRIES,
     COMMIT_NUM_RETRIES_DEFAULT,
+    COMMIT_RETRY_TOTAL_TIMEOUT_MS,
+    COMMIT_RETRY_TOTAL_TIMEOUT_MS_DEFAULT,
     INITIAL_SEQUENCE_NUMBER,
     TableMetadata,
 )
@@ -785,6 +787,7 @@ class Transaction:
         min_wait_ms = int(self.table_metadata.properties.get(COMMIT_MIN_RETRY_WAIT_MS, COMMIT_MIN_RETRY_WAIT_MS_DEFAULT))
         max_wait_ms = int(self.table_metadata.properties.get(COMMIT_MAX_RETRY_WAIT_MS, COMMIT_MAX_RETRY_WAIT_MS_DEFAULT))
         num_retries = int(self.table_metadata.properties.get(COMMIT_NUM_RETRIES, COMMIT_NUM_RETRIES_DEFAULT))
+        timeout_ms = int(self.table_metadata.properties.get(COMMIT_RETRY_TOTAL_TIMEOUT_MS, COMMIT_RETRY_TOTAL_TIMEOUT_MS_DEFAULT))
 
         def _before_attempt(state: RetryCallState):
             if state.attempt_number > 1:
@@ -814,7 +817,7 @@ class Transaction:
         @wraps(self.commit_transaction)
         @retry(
             wait=wait_random_exponential(min=min_wait_ms / 1000, max=max_wait_ms / 1000),
-            stop=stop_after_attempt(num_retries + 1),
+            stop=(stop_after_attempt(num_retries + 1) | stop_after_delay(timeout_ms / 1000)),
             retry=retry_if_exception_type(CommitFailedException),
             before=_before_attempt,
             retry_error_callback=_error_callback,
