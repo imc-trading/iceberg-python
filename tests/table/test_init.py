@@ -16,7 +16,6 @@
 # under the License.
 # pylint:disable=redefined-outer-name
 import json
-from unittest.mock import Mock
 import uuid
 from copy import copy
 from typing import Any, Dict
@@ -44,7 +43,6 @@ from pyiceberg.manifest import (
 from pyiceberg.partitioning import PartitionField, PartitionSpec
 from pyiceberg.schema import Schema
 from pyiceberg.table import (
-    ALWAYS_TRUE,
     CommitTableRequest,
     StaticTable,
     Table,
@@ -52,14 +50,13 @@ from pyiceberg.table import (
     _match_deletes_to_data_file,
 )
 from pyiceberg.table.metadata import INITIAL_SEQUENCE_NUMBER, TableMetadataUtil, TableMetadataV2, _generate_snapshot_id
-from pyiceberg.table.refs import SnapshotRef
+from pyiceberg.table.refs import MAIN_BRANCH, SnapshotRef, SnapshotRefType
 from pyiceberg.table.snapshots import (
     MetadataLogEntry,
     Operation,
     Snapshot,
     SnapshotLogEntry,
     Summary,
-    ancestors_of,
 )
 from pyiceberg.table.sorting import (
     NullOrder,
@@ -67,7 +64,7 @@ from pyiceberg.table.sorting import (
     SortField,
     SortOrder,
 )
-from pyiceberg.table.statistics import BlobMetadata, StatisticsFile
+from pyiceberg.table.statistics import BlobMetadata, PartitionStatisticsFile, StatisticsFile
 from pyiceberg.table.update import (
     AddSnapshotUpdate,
     AddSortOrderUpdate,
@@ -79,11 +76,13 @@ from pyiceberg.table.update import (
     AssertLastAssignedPartitionId,
     AssertRefSnapshotId,
     AssertTableUUID,
+    RemovePartitionStatisticsUpdate,
     RemovePropertiesUpdate,
     RemoveSnapshotRefUpdate,
     RemoveSnapshotsUpdate,
     RemoveStatisticsUpdate,
     SetDefaultSortOrderUpdate,
+    SetPartitionStatisticsUpdate,
     SetPropertiesUpdate,
     SetSnapshotRefUpdate,
     SetStatisticsUpdate,
@@ -96,7 +95,6 @@ from pyiceberg.transforms import (
     BucketTransform,
     IdentityTransform,
 )
-from pyiceberg.typedef import Record
 from pyiceberg.types import (
     BinaryType,
     BooleanType,
@@ -228,44 +226,6 @@ def test_snapshot_by_timestamp(table_v2: Table) -> None:
     assert table_v2.snapshot_as_of_timestamp(1515100955770, inclusive=False) is None
 
 
-def test_ancestors_of(table_v2: Table) -> None:
-    assert list(ancestors_of(table_v2.current_snapshot(), table_v2.metadata)) == [
-        Snapshot(
-            snapshot_id=3055729675574597004,
-            parent_snapshot_id=3051729675574597004,
-            sequence_number=1,
-            timestamp_ms=1555100955770,
-            manifest_list="s3://a/b/2.avro",
-            summary=Summary(Operation.APPEND),
-            schema_id=1,
-        ),
-        Snapshot(
-            snapshot_id=3051729675574597004,
-            parent_snapshot_id=None,
-            sequence_number=0,
-            timestamp_ms=1515100955770,
-            manifest_list="s3://a/b/1.avro",
-            summary=Summary(Operation.APPEND),
-            schema_id=None,
-        ),
-    ]
-
-
-def test_ancestors_of_recursive_error(table_v2_with_extensive_snapshots: Table) -> None:
-    # Test RecursionError: maximum recursion depth exceeded
-    assert (
-        len(
-            list(
-                ancestors_of(
-                    table_v2_with_extensive_snapshots.current_snapshot(),
-                    table_v2_with_extensive_snapshots.metadata,
-                )
-            )
-        )
-        == 2000
-    )
-
-
 def test_snapshot_by_id_does_not_exist(table_v2: Table) -> None:
     assert table_v2.snapshot_by_id(-1) is None
 
@@ -386,16 +346,22 @@ def test_static_table_gz_same_as_table(table_v2: Table, metadata_location_gz: st
     assert static_table.metadata == table_v2.metadata
 
 
+def test_static_table_version_hint_same_as_table(table_v2: Table, table_location: str) -> None:
+    static_table = StaticTable.from_metadata(table_location)
+    assert isinstance(static_table, Table)
+    assert static_table.metadata == table_v2.metadata
+
+
 def test_static_table_io_does_not_exist(metadata_location: str) -> None:
     with pytest.raises(ValueError):
         StaticTable.from_metadata(metadata_location, {PY_IO_IMPL: "pyiceberg.does.not.exist.FileIO"})
 
 
 def test_match_deletes_to_datafile() -> None:
-    data_entry = ManifestEntry(
+    data_entry = ManifestEntry.from_args(
         status=ManifestEntryStatus.ADDED,
         sequence_number=1,
-        data_file=DataFile(
+        data_file=DataFile.from_args(
             content=DataFileContent.DATA,
             file_path="s3://bucket/0000.parquet",
             file_format=FileFormat.PARQUET,
@@ -404,10 +370,10 @@ def test_match_deletes_to_datafile() -> None:
             file_size_in_bytes=3,
         ),
     )
-    delete_entry_1 = ManifestEntry(
+    delete_entry_1 = ManifestEntry.from_args(
         status=ManifestEntryStatus.ADDED,
         sequence_number=0,  # Older than the data
-        data_file=DataFile(
+        data_file=DataFile.from_args(
             content=DataFileContent.POSITION_DELETES,
             file_path="s3://bucket/0001-delete.parquet",
             file_format=FileFormat.PARQUET,
@@ -416,10 +382,10 @@ def test_match_deletes_to_datafile() -> None:
             file_size_in_bytes=3,
         ),
     )
-    delete_entry_2 = ManifestEntry(
+    delete_entry_2 = ManifestEntry.from_args(
         status=ManifestEntryStatus.ADDED,
         sequence_number=3,
-        data_file=DataFile(
+        data_file=DataFile.from_args(
             content=DataFileContent.POSITION_DELETES,
             file_path="s3://bucket/0002-delete.parquet",
             file_format=FileFormat.PARQUET,
@@ -443,10 +409,10 @@ def test_match_deletes_to_datafile() -> None:
 
 
 def test_match_deletes_to_datafile_duplicate_number() -> None:
-    data_entry = ManifestEntry(
+    data_entry = ManifestEntry.from_args(
         status=ManifestEntryStatus.ADDED,
         sequence_number=1,
-        data_file=DataFile(
+        data_file=DataFile.from_args(
             content=DataFileContent.DATA,
             file_path="s3://bucket/0000.parquet",
             file_format=FileFormat.PARQUET,
@@ -455,10 +421,10 @@ def test_match_deletes_to_datafile_duplicate_number() -> None:
             file_size_in_bytes=3,
         ),
     )
-    delete_entry_1 = ManifestEntry(
+    delete_entry_1 = ManifestEntry.from_args(
         status=ManifestEntryStatus.ADDED,
         sequence_number=3,
-        data_file=DataFile(
+        data_file=DataFile.from_args(
             content=DataFileContent.POSITION_DELETES,
             file_path="s3://bucket/0001-delete.parquet",
             file_format=FileFormat.PARQUET,
@@ -473,10 +439,10 @@ def test_match_deletes_to_datafile_duplicate_number() -> None:
             upper_bounds={},
         ),
     )
-    delete_entry_2 = ManifestEntry(
+    delete_entry_2 = ManifestEntry.from_args(
         status=ManifestEntryStatus.ADDED,
         sequence_number=3,
-        data_file=DataFile(
+        data_file=DataFile.from_args(
             content=DataFileContent.POSITION_DELETES,
             file_path="s3://bucket/0002-delete.parquet",
             file_format=FileFormat.PARQUET,
@@ -547,15 +513,15 @@ def test_update_column(table_v1: Table, table_v2: Table) -> None:
         assert new_schema3.find_field("z").required is False, "failed to update existing field required"
 
         # assert the above two updates also works with union_by_name
-        assert (
-            table.update_schema().union_by_name(new_schema)._apply() == new_schema
-        ), "failed to update existing field doc with union_by_name"
-        assert (
-            table.update_schema().union_by_name(new_schema2)._apply() == new_schema2
-        ), "failed to remove existing field doc with union_by_name"
-        assert (
-            table.update_schema().union_by_name(new_schema3)._apply() == new_schema3
-        ), "failed to update existing field required with union_by_name"
+        assert table.update_schema().union_by_name(new_schema)._apply() == new_schema, (
+            "failed to update existing field doc with union_by_name"
+        )
+        assert table.update_schema().union_by_name(new_schema2)._apply() == new_schema2, (
+            "failed to remove existing field doc with union_by_name"
+        )
+        assert table.update_schema().union_by_name(new_schema3)._apply() == new_schema3, (
+            "failed to update existing field required with union_by_name"
+        )
 
 
 def test_add_primitive_type_column(table_v2: Table) -> None:
@@ -1036,28 +1002,45 @@ def test_assert_table_uuid(table_v2: Table) -> None:
 
 def test_assert_ref_snapshot_id(table_v2: Table) -> None:
     base_metadata = table_v2.metadata
-    AssertRefSnapshotId(ref="main", snapshot_id=base_metadata.current_snapshot_id).validate(base_metadata)
+    AssertRefSnapshotId(ref=MAIN_BRANCH, snapshot_id=base_metadata.current_snapshot_id).validate(base_metadata)
 
     with pytest.raises(CommitFailedException, match="Requirement failed: current table metadata is missing"):
-        AssertRefSnapshotId(ref="main", snapshot_id=1).validate(None)
+        AssertRefSnapshotId(ref=MAIN_BRANCH, snapshot_id=1).validate(None)
 
     with pytest.raises(
         CommitFailedException,
-        match="Requirement failed: branch main was created concurrently",
+        match=f"Requirement failed: branch {MAIN_BRANCH} was created concurrently",
     ):
-        AssertRefSnapshotId(ref="main", snapshot_id=None).validate(base_metadata)
+        AssertRefSnapshotId(ref=MAIN_BRANCH, snapshot_id=None).validate(base_metadata)
 
     with pytest.raises(
         CommitFailedException,
-        match="Requirement failed: branch main has changed: expected id 1, found 3055729675574597004",
+        match=f"Requirement failed: branch {MAIN_BRANCH} has changed: expected id 1, found 3055729675574597004",
     ):
-        AssertRefSnapshotId(ref="main", snapshot_id=1).validate(base_metadata)
+        AssertRefSnapshotId(ref=MAIN_BRANCH, snapshot_id=1).validate(base_metadata)
+
+    non_existing_ref = "not_exist_branch_or_tag"
+    assert table_v2.refs().get("not_exist_branch_or_tag") is None
 
     with pytest.raises(
         CommitFailedException,
-        match="Requirement failed: branch or tag not_exist is missing, expected 1",
+        match=f"Requirement failed: branch or tag {non_existing_ref} is missing, expected 1",
     ):
-        AssertRefSnapshotId(ref="not_exist", snapshot_id=1).validate(base_metadata)
+        AssertRefSnapshotId(ref=non_existing_ref, snapshot_id=1).validate(base_metadata)
+
+    # existing Tag in metadata: test
+    ref_tag = table_v2.refs().get("test")
+    assert ref_tag is not None
+    assert ref_tag.snapshot_ref_type == SnapshotRefType.TAG, "TAG test should be present in table to be tested"
+
+    with pytest.raises(
+        CommitFailedException,
+        match="Requirement failed: tag test has changed: expected id 3055729675574597004, found 3051729675574597004",
+    ):
+        AssertRefSnapshotId(ref="test", snapshot_id=3055729675574597004).validate(base_metadata)
+
+    expected_json = '{"type":"assert-ref-snapshot-id","ref":"main","snapshot-id":null}'
+    assert AssertRefSnapshotId(ref="main").model_dump_json() == expected_json
 
 
 def test_assert_last_assigned_field_id(table_v2: Table) -> None:
@@ -1383,89 +1366,77 @@ def test_remove_statistics_update(table_v2_with_statistics: Table) -> None:
         )
 
 
-def test_transaction_commit_retry(table_v1: Table, mocker: Mock) -> None:
-    import pyarrow as pa
+def test_set_partition_statistics_update(table_v2_with_statistics: Table) -> None:
+    snapshot_id = table_v2_with_statistics.metadata.current_snapshot_id
 
-    mock_data_file = DataFile(
-        content=DataFileContent.DATA,
-        file_path="s3://some-path/some-file.parquet",
-        file_format=FileFormat.PARQUET,
-        partition=Record(),
-        record_count=131327,
-        file_size_in_bytes=220669226,
-        column_sizes={1: 220661854},
-        value_counts={1: 131327},
-        null_value_counts={1: 0},
-        nan_value_counts={},
-        lower_bounds={1: b"aaaaaaaaaaaaaaaa"},
-        upper_bounds={1: b"zzzzzzzzzzzzzzzz"},
-        key_metadata=b"\xde\xad\xbe\xef",
-        split_offsets=[4, 133697593],
-        equality_ids=[],
-        sort_order_id=4,
+    partition_statistics_file = PartitionStatisticsFile(
+        snapshot_id=snapshot_id,
+        statistics_path="s3://bucket/warehouse/stats.puffin",
+        file_size_in_bytes=124,
     )
 
-    call_count = 0
-    captured_args = []
-
-    def mock_do_commit(*args, **kwargs):
-        """Capture arguments to `Transaction._do_commit` and invoke an initial retry."""
-
-        nonlocal call_count
-        captured_args.append((args, kwargs))
-        call_count += 1
-        if call_count == 1:
-            raise CommitFailedException("Test")
-        return None
-
-    # Patch out IO of data, manifests, and metadata
-    mocker.patch("pyiceberg.io.pyarrow.write_file", return_value=[mock_data_file])
-    mocker.patch("pyiceberg.table.update.snapshot.write_manifest")
-    mocker.patch("pyiceberg.table.update.snapshot.write_manifest_list")
-    mocker.patch("pyiceberg.catalog.noop.NoopCatalog.load_table", return_value=table_v1)
-    mocker.patch("pyiceberg.table.Table._do_commit", side_effect=mock_do_commit)
-
-    schema = pa.schema(
-        [
-            pa.field("x", pa.int64(), nullable=False),
-            pa.field("y", pa.int64(), nullable=False),
-            pa.field("z", pa.int64(), nullable=False),
-        ]
+    update = SetPartitionStatisticsUpdate(
+        partition_statistics=partition_statistics_file,
     )
 
-    trx = table_v1.transaction()
-    with pytest.warns(UserWarning):
-        trx.delete(ALWAYS_TRUE)
-    trx.append(pa.Table.from_pydict({"x": [1, 2, 3], "y": [4, 5, 6], "z": [7, 8, 9]}, schema=schema))
-    trx.commit_transaction()
-
-    # Verify that _do_commit was called twice (first failed, second succeeded)
-    assert call_count == 2, f"Expected 2 calls to _do_commit, got {call_count}"
-
-    # Inspect the arguments passed to both commit attempts
-    _, first_call_kwargs = captured_args[0]
-    _, second_call_kwargs = captured_args[1]
-
-    # Extract updates and requirements from both calls
-    first_updates = first_call_kwargs.get("updates", ())
-    first_requirements = first_call_kwargs.get("requirements", ())
-    second_updates = second_call_kwargs.get("updates", ())
-    second_requirements = second_call_kwargs.get("requirements", ())
-
-    # Assert retry has same number of updates and requirements as first attempt
-    assert len(first_updates) == len(second_updates), f"Updates count mismatch: {len(first_updates)} vs {len(second_updates)}"
-    assert len(first_requirements) == len(second_requirements), (
-        f"Requirements count mismatch: {len(first_requirements)} vs {len(second_requirements)}"
+    new_metadata = update_table_metadata(
+        table_v2_with_statistics.metadata,
+        (update,),
     )
 
-    # Assert retry has same types of updates as first attempt
-    first_update_types = [type(update).__name__ for update in first_updates]
-    second_update_types = [type(update).__name__ for update in second_updates]
-    assert first_update_types == second_update_types, f"Update types mismatch: {first_update_types} vs {second_update_types}"
+    expected = """
+    {
+      "snapshot-id": 3055729675574597004,
+      "statistics-path": "s3://bucket/warehouse/stats.puffin",
+      "file-size-in-bytes": 124
+    }"""
 
-    # Assert retry has same types of requirements as first attempt
-    first_requirement_types = [type(req).__name__ for req in first_requirements]
-    second_requirement_types = [type(req).__name__ for req in second_requirements]
-    assert first_requirement_types == second_requirement_types, (
-        f"Requirement types mismatch: {first_requirement_types} vs {second_requirement_types}"
+    assert len(new_metadata.partition_statistics) == 1
+
+    updated_statistics = [stat for stat in new_metadata.partition_statistics if stat.snapshot_id == snapshot_id]
+
+    assert len(updated_statistics) == 1
+    assert json.loads(updated_statistics[0].model_dump_json()) == json.loads(expected)
+
+
+def test_remove_partition_statistics_update(table_v2_with_statistics: Table) -> None:
+    # Add partition statistics file.
+    snapshot_id = table_v2_with_statistics.metadata.current_snapshot_id
+
+    partition_statistics_file = PartitionStatisticsFile(
+        snapshot_id=snapshot_id,
+        statistics_path="s3://bucket/warehouse/stats.puffin",
+        file_size_in_bytes=124,
     )
+
+    update = SetPartitionStatisticsUpdate(
+        partition_statistics=partition_statistics_file,
+    )
+
+    new_metadata = update_table_metadata(
+        table_v2_with_statistics.metadata,
+        (update,),
+    )
+    assert len(new_metadata.partition_statistics) == 1
+
+    # Remove the same partition statistics file.
+    remove_update = RemovePartitionStatisticsUpdate(snapshot_id=snapshot_id)
+
+    remove_metadata = update_table_metadata(
+        new_metadata,
+        (remove_update,),
+    )
+
+    assert len(remove_metadata.partition_statistics) == 0
+
+
+def test_remove_partition_statistics_update_with_invalid_snapshot_id(table_v2_with_statistics: Table) -> None:
+    # Remove the same partition statistics file.
+    with pytest.raises(
+        ValueError,
+        match="Partition Statistics with snapshot id 123456789 does not exist",
+    ):
+        update_table_metadata(
+            table_v2_with_statistics.metadata,
+            (RemovePartitionStatisticsUpdate(snapshot_id=123456789),),
+        )

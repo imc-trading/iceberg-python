@@ -35,6 +35,7 @@ from hive_metastore.ThriftHiveMetastore import Client
 from hive_metastore.ttypes import (
     AlreadyExistsException,
     CheckLockRequest,
+    EnvironmentContext,
     FieldSchema,
     GetTableRequest,
     InvalidOperationException,
@@ -62,6 +63,7 @@ from pyiceberg.catalog import (
     LOCATION,
     METADATA_LOCATION,
     TABLE_TYPE,
+    URI,
     MetastoreCatalog,
     PropertiesUpdateSummary,
 )
@@ -111,6 +113,7 @@ from pyiceberg.types import (
     TimestampType,
     TimestamptzType,
     TimeType,
+    UnknownType,
     UUIDType,
 )
 from pyiceberg.utils.properties import property_as_bool, property_as_float, property_as_int
@@ -128,6 +131,8 @@ HIVE2_COMPATIBLE_DEFAULT = False
 
 HIVE_KERBEROS_AUTH = "hive.kerberos-authentication"
 HIVE_KERBEROS_AUTH_DEFAULT = False
+HIVE_KERBEROS_SERVICE_NAME = "hive.kerberos-service-name"
+HIVE_KERBEROS_SERVICE_NAME_DEFAULT = "hive"
 
 LOCK_CHECK_MIN_WAIT_TIME = "lock-check-min-wait-time"
 LOCK_CHECK_MAX_WAIT_TIME = "lock-check-max-wait-time"
@@ -135,6 +140,8 @@ LOCK_CHECK_RETRIES = "lock-check-retries"
 DEFAULT_LOCK_CHECK_MIN_WAIT_TIME = 1  # 1 second
 DEFAULT_LOCK_CHECK_MAX_WAIT_TIME = 5  # 5 seconds
 DEFAULT_LOCK_CHECK_RETRIES = 32
+DO_NOT_UPDATE_STATS = "DO_NOT_UPDATE_STATS"
+DO_NOT_UPDATE_STATS_DEFAULT = "true"
 
 
 logger = get_logger(__name__)
@@ -146,9 +153,16 @@ class _HiveClient:
     _transport: TTransport
     _ugi: Optional[List[str]]
 
-    def __init__(self, uri: str, ugi: Optional[str] = None, kerberos_auth: Optional[bool] = HIVE_KERBEROS_AUTH_DEFAULT):
+    def __init__(
+        self,
+        uri: str,
+        ugi: Optional[str] = None,
+        kerberos_auth: Optional[bool] = HIVE_KERBEROS_AUTH_DEFAULT,
+        kerberos_service_name: Optional[str] = HIVE_KERBEROS_SERVICE_NAME,
+    ):
         self._uri = uri
         self._kerberos_auth = kerberos_auth
+        self._kerberos_service_name = kerberos_service_name
         self._ugi = ugi.split(":") if ugi else None
         self._transport = self._init_thrift_transport()
 
@@ -158,7 +172,7 @@ class _HiveClient:
         if not self._kerberos_auth:
             return TTransport.TBufferedTransport(socket)
         else:
-            return TTransport.TSaslClientTransport(socket, host=url_parts.hostname, service="hive")
+            return TTransport.TSaslClientTransport(socket, host=url_parts.hostname, service=self._kerberos_service_name)
 
     def _client(self) -> Client:
         protocol = TBinaryProtocol.TBinaryProtocol(self._transport)
@@ -209,10 +223,17 @@ PROP_PREVIOUS_METADATA_LOCATION = "previous_metadata_location"
 DEFAULT_PROPERTIES = {TableProperties.PARQUET_COMPRESSION: TableProperties.PARQUET_COMPRESSION_DEFAULT}
 
 
-def _construct_parameters(metadata_location: str, previous_metadata_location: Optional[str] = None) -> Dict[str, Any]:
+def _construct_parameters(
+    metadata_location: str, previous_metadata_location: Optional[str] = None, metadata_properties: Optional[Properties] = None
+) -> Dict[str, Any]:
     properties = {PROP_EXTERNAL: "TRUE", PROP_TABLE_TYPE: "ICEBERG", PROP_METADATA_LOCATION: metadata_location}
     if previous_metadata_location:
         properties[PROP_PREVIOUS_METADATA_LOCATION] = previous_metadata_location
+
+    if metadata_properties:
+        for key, value in metadata_properties.items():
+            if key not in properties:
+                properties[key] = str(value)
 
     return properties
 
@@ -244,6 +265,7 @@ HIVE_PRIMITIVE_TYPES = {
     UUIDType: "string",
     BinaryType: "binary",
     FixedType: "binary",
+    UnknownType: "void",
 }
 
 
@@ -297,19 +319,20 @@ class HiveCatalog(MetastoreCatalog):
     @staticmethod
     def _create_hive_client(properties: Dict[str, str]) -> _HiveClient:
         last_exception = None
-        for uri in properties["uri"].split(","):
+        for uri in properties[URI].split(","):
             try:
                 return _HiveClient(
                     uri,
                     properties.get("ugi"),
                     property_as_bool(properties, HIVE_KERBEROS_AUTH, HIVE_KERBEROS_AUTH_DEFAULT),
+                    properties.get(HIVE_KERBEROS_SERVICE_NAME, HIVE_KERBEROS_SERVICE_NAME_DEFAULT),
                 )
             except BaseException as e:
                 last_exception = e
         if last_exception is not None:
             raise last_exception
         else:
-            raise ValueError(f"Unable to connect to hive using uri: {properties['uri']}")
+            raise ValueError(f"Unable to connect to hive using uri: {properties[URI]}")
 
     def _convert_hive_into_iceberg(self, table: HiveTable) -> Table:
         properties: Dict[str, str] = table.parameters
@@ -357,7 +380,7 @@ class HiveCatalog(MetastoreCatalog):
                 property_as_bool(self.properties, HIVE2_COMPATIBLE, HIVE2_COMPATIBLE_DEFAULT),
             ),
             tableType=EXTERNAL_TABLE,
-            parameters=_construct_parameters(table.metadata_location),
+            parameters=_construct_parameters(metadata_location=table.metadata_location, metadata_properties=table.properties),
         )
 
     def _create_hive_table(self, open_client: Client, hive_table: HiveTable) -> None:
@@ -546,8 +569,20 @@ class HiveCatalog(MetastoreCatalog):
                     hive_table.parameters = _construct_parameters(
                         metadata_location=updated_staged_table.metadata_location,
                         previous_metadata_location=current_table.metadata_location,
+                        metadata_properties=updated_staged_table.properties,
                     )
-                    open_client.alter_table(dbname=database_name, tbl_name=table_name, new_tbl=hive_table)
+                    # Update hive's schema and properties
+                    hive_table.sd = _construct_hive_storage_descriptor(
+                        updated_staged_table.schema(),
+                        updated_staged_table.location(),
+                        property_as_bool(updated_staged_table.properties, HIVE2_COMPATIBLE, HIVE2_COMPATIBLE_DEFAULT),
+                    )
+                    open_client.alter_table_with_environment_context(
+                        dbname=database_name,
+                        tbl_name=table_name,
+                        new_tbl=hive_table,
+                        environment_context=EnvironmentContext(properties={DO_NOT_UPDATE_STATS: DO_NOT_UPDATE_STATS_DEFAULT}),
+                    )
                 else:
                     # Table does not exist, create it.
                     hive_table = self._convert_iceberg_into_hive(
@@ -626,15 +661,25 @@ class HiveCatalog(MetastoreCatalog):
             ValueError: When from table identifier is invalid.
             NoSuchTableError: When a table with the name does not exist.
             NoSuchNamespaceError: When the destination namespace doesn't exist.
+            TableAlreadyExistsError: When the destination table already exists.
         """
         from_database_name, from_table_name = self.identifier_to_database_and_table(from_identifier, NoSuchTableError)
         to_database_name, to_table_name = self.identifier_to_database_and_table(to_identifier)
+
+        if self.table_exists(to_identifier):
+            raise TableAlreadyExistsError(f"Table already exists: {to_table_name}")
+
         try:
             with self._client as open_client:
                 tbl = open_client.get_table_req(GetTableRequest(dbName=from_database_name, tblName=from_table_name)).table
                 tbl.dbName = to_database_name
                 tbl.tableName = to_table_name
-                open_client.alter_table(dbname=from_database_name, tbl_name=from_table_name, new_tbl=tbl)
+                open_client.alter_table_with_environment_context(
+                    dbname=from_database_name,
+                    tbl_name=from_table_name,
+                    new_tbl=tbl,
+                    environment_context=EnvironmentContext(properties={DO_NOT_UPDATE_STATS: DO_NOT_UPDATE_STATS_DEFAULT}),
+                )
         except NoSuchObjectException as e:
             raise NoSuchTableError(f"Table does not exist: {from_table_name}") from e
         except InvalidOperationException as e:
@@ -770,7 +815,7 @@ class HiveCatalog(MetastoreCatalog):
             if removals:
                 for key in removals:
                     if key in parameters:
-                        parameters[key] = None
+                        parameters.pop(key)
                         removed.add(key)
             if updates:
                 for key, value in updates.items():
@@ -785,3 +830,7 @@ class HiveCatalog(MetastoreCatalog):
 
     def drop_view(self, identifier: Union[str, Identifier]) -> None:
         raise NotImplementedError
+
+    def _get_default_warehouse_location(self, database_name: str, table_name: str) -> str:
+        """Override the default warehouse location to follow Hive-style conventions."""
+        return self._get_hive_style_warehouse_location(database_name, table_name)

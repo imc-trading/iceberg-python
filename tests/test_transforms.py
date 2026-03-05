@@ -30,7 +30,9 @@ from pydantic import (
     RootModel,
     WithJsonSchema,
 )
+from pytest_mock import MockFixture
 
+from pyiceberg.exceptions import NotInstalledError
 from pyiceberg.expressions import (
     AlwaysFalse,
     BooleanExpression,
@@ -103,9 +105,12 @@ from pyiceberg.types import (
     NestedField,
     PrimitiveType,
     StringType,
+    TimestampNanoType,
     TimestampType,
+    TimestamptzNanoType,
     TimestamptzType,
     TimeType,
+    UnknownType,
     UUIDType,
 )
 from pyiceberg.utils.datetime import (
@@ -113,7 +118,9 @@ from pyiceberg.utils.datetime import (
     date_to_days,
     time_str_to_micros,
     timestamp_to_micros,
+    timestamp_to_nanos,
     timestamptz_to_micros,
+    timestamptz_to_nanos,
 )
 
 
@@ -141,6 +148,26 @@ from pyiceberg.utils.datetime import (
         ("iceberg", StringType(), 1210000089),
         (UUID("f79c3e09-677c-4bbd-a479-3f349cb785e7"), UUIDType(), 1488055340),
         (b"\xf7\x9c>\tg|K\xbd\xa4y?4\x9c\xb7\x85\xe7", UUIDType(), 1488055340),
+        (
+            timestamp_to_nanos("2017-11-16T22:31:08.000001"),
+            TimestampNanoType(),
+            -1207196810,
+        ),
+        (
+            timestamp_to_nanos("2017-11-16T22:31:08.000001001"),
+            TimestampNanoType(),
+            -1207196810,
+        ),
+        (
+            timestamptz_to_nanos("2017-11-16T14:31:08.000001-08:00"),
+            TimestamptzNanoType(),
+            -1207196810,
+        ),
+        (
+            timestamptz_to_nanos("2017-11-16T14:31:08.000001001-08:00"),
+            TimestamptzNanoType(),
+            -1207196810,
+        ),
     ],
 )
 def test_bucket_hash_values(test_input: Any, test_type: PrimitiveType, expected: Any) -> None:
@@ -200,6 +227,31 @@ def test_bucket_method(type_var: PrimitiveType) -> None:
     assert bucket_transform.num_buckets == 8
     assert bucket_transform.apply(None) is None
     assert bucket_transform.to_human_string(type_var, "test") == "test"
+
+
+@pytest.mark.parametrize(
+    "test_transform",
+    [
+        BucketTransform(8),
+        TruncateTransform(10),
+        YearTransform(),
+        MonthTransform(),
+        DayTransform(),
+        HourTransform(),
+        UnknownTransform("unknown"),
+    ],
+)
+def test_transforms_unknown_type(test_transform: Transform[Any, Any]) -> None:
+    assert not test_transform.can_transform(UnknownType())
+    with pytest.raises((ValueError, AttributeError)):
+        test_transform.transform(UnknownType())
+
+
+def test_identity_transform_unknown_type() -> None:
+    assert IdentityTransform().can_transform(UnknownType())
+    assert IdentityTransform().result_type(UnknownType()) == UnknownType()
+    assert IdentityTransform().transform(UnknownType())(None) is None
+    assert IdentityTransform().to_human_string(UnknownType(), None) == "null"
 
 
 def test_string_with_surrogate_pair() -> None:
@@ -1577,7 +1629,7 @@ def test_ymd_pyarrow_transforms(
         ]
     else:
         with pytest.raises(ValueError):
-            transform.pyarrow_transform(DateType())(arrow_table_date_timestamps[source_col])
+            transform.pyarrow_transform(source_type)(arrow_table_date_timestamps[source_col])
 
 
 @pytest.mark.parametrize(
@@ -1603,6 +1655,12 @@ def test_bucket_pyarrow_transforms(
     assert expected == transform.pyarrow_transform(source_type)(input_arr)
 
 
+def test_bucket_pyarrow_void_transform() -> None:
+    input_arr = pa.chunked_array([pa.array([1, 2], type=pa.int32()), pa.array([3, 4], type=pa.int32())])
+    output_arr = pa.array([None, None, None, None], type=pa.int32())
+    assert output_arr == VoidTransform().pyarrow_transform(IntegerType())(input_arr)
+
+
 @pytest.mark.parametrize(
     "source_type, input_arr, expected, width",
     [
@@ -1618,3 +1676,15 @@ def test_truncate_pyarrow_transforms(
 ) -> None:
     transform: Transform[Any, Any] = TruncateTransform(width=width)
     assert expected == transform.pyarrow_transform(source_type)(input_arr)
+
+
+@pytest.mark.parametrize(
+    "transform", [BucketTransform(num_buckets=5), TruncateTransform(width=5), YearTransform(), MonthTransform(), DayTransform()]
+)
+def test_calling_pyarrow_transform_without_pyiceberg_core_installed_correctly_raises_not_imported_error(
+    transform, mocker: MockFixture
+) -> None:
+    mocker.patch.dict("sys.modules", {"pyiceberg_core": None})
+
+    with pytest.raises(NotInstalledError):
+        transform.pyarrow_transform(StringType())

@@ -24,10 +24,9 @@ from datetime import datetime
 from functools import singledispatch, wraps
 from typing import TYPE_CHECKING, Annotated, Any, Dict, Generic, List, Literal, Optional, Tuple, TypeVar, Union, cast
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import Field, field_validator, model_serializer, model_validator
 from tenacity import (
     RetryCallState,
-    before_sleep_log,
     retry,
     retry_if_exception_type,
     stop_after_attempt,
@@ -51,14 +50,18 @@ from pyiceberg.table.metadata import (
     TableMetadata,
     TableMetadataUtil,
 )
-from pyiceberg.table.refs import MAIN_BRANCH, SnapshotRef
+from pyiceberg.table.refs import MAIN_BRANCH, SnapshotRef, SnapshotRefType
 from pyiceberg.table.snapshots import (
     MetadataLogEntry,
     Snapshot,
     SnapshotLogEntry,
 )
 from pyiceberg.table.sorting import SortOrder
-from pyiceberg.table.statistics import StatisticsFile, filter_statistics_by_snapshot_id
+from pyiceberg.table.statistics import (
+    PartitionStatisticsFile,
+    StatisticsFile,
+    filter_statistics_by_snapshot_id,
+)
 from pyiceberg.typedef import (
     IcebergBaseModel,
     Properties,
@@ -67,10 +70,11 @@ from pyiceberg.types import (
     transform_dict_value_to_str,
 )
 from pyiceberg.utils.datetime import datetime_to_millis
-from pyiceberg.utils.deprecated import deprecation_notice
 from pyiceberg.utils.properties import property_as_int
 
 if TYPE_CHECKING:
+    from pydantic.functional_serializers import ModelWrapSerializerWithoutInfo
+
     from pyiceberg.table import Transaction
 
 U = TypeVar("U")
@@ -146,16 +150,6 @@ class UpgradeFormatVersionUpdate(IcebergBaseModel):
 class AddSchemaUpdate(IcebergBaseModel):
     action: Literal["add-schema"] = Field(default="add-schema")
     schema_: Schema = Field(alias="schema")
-    # This field is required: https://github.com/apache/iceberg/pull/7445
-    last_column_id: Optional[int] = Field(
-        alias="last-column-id",
-        default=None,
-        deprecated=deprecation_notice(
-            deprecated_in="0.9.0",
-            removed_in="0.10.0",
-            help_message="last-field-id is handled internally, and should not be part of the update.",
-        ),
-    )
 
 
 class SetCurrentSchemaUpdate(IcebergBaseModel):
@@ -197,7 +191,7 @@ class AddSnapshotUpdate(IcebergBaseModel):
 class SetSnapshotRefUpdate(IcebergBaseModel):
     action: Literal["set-snapshot-ref"] = Field(default="set-snapshot-ref")
     ref_name: str = Field(alias="ref-name")
-    type: Literal["tag", "branch"]
+    type: Literal[SnapshotRefType.TAG, SnapshotRefType.BRANCH]
     snapshot_id: int = Field(alias="snapshot-id")
     max_ref_age_ms: Annotated[Optional[int], Field(alias="max-ref-age-ms", default=None)]
     max_snapshot_age_ms: Annotated[Optional[int], Field(alias="max-snapshot-age-ms", default=None)]
@@ -256,6 +250,16 @@ class RemoveStatisticsUpdate(IcebergBaseModel):
     snapshot_id: int = Field(alias="snapshot-id")
 
 
+class SetPartitionStatisticsUpdate(IcebergBaseModel):
+    action: Literal["set-partition-statistics"] = Field(default="set-partition-statistics")
+    partition_statistics: PartitionStatisticsFile
+
+
+class RemovePartitionStatisticsUpdate(IcebergBaseModel):
+    action: Literal["remove-partition-statistics"] = Field(default="remove-partition-statistics")
+    snapshot_id: int = Field(alias="snapshot-id")
+
+
 TableUpdate = Annotated[
     Union[
         AssignUUIDUpdate,
@@ -275,6 +279,8 @@ TableUpdate = Annotated[
         RemovePropertiesUpdate,
         SetStatisticsUpdate,
         RemoveStatisticsUpdate,
+        SetPartitionStatisticsUpdate,
+        RemovePartitionStatisticsUpdate,
     ],
     Field(discriminator="action"),
 ]
@@ -418,7 +424,8 @@ def _(update: SetCurrentSchemaUpdate, base_metadata: TableMetadata, context: _Ta
 @_apply_table_update.register(AddPartitionSpecUpdate)
 def _(update: AddPartitionSpecUpdate, base_metadata: TableMetadata, context: _TableMetadataUpdateContext) -> TableMetadata:
     for spec in base_metadata.partition_specs:
-        if spec.spec_id == update.spec.spec_id:
+        # Only raise in case of a discrepancy
+        if spec.spec_id == update.spec.spec_id and spec != update.spec:
             raise ValueError(f"Partition spec with id {spec.spec_id} already exists: {spec}")
 
     metadata_updates: Dict[str, Any] = {
@@ -583,6 +590,11 @@ def _(update: RemoveSnapshotRefUpdate, base_metadata: TableMetadata, context: _T
 
 @_apply_table_update.register(AddSortOrderUpdate)
 def _(update: AddSortOrderUpdate, base_metadata: TableMetadata, context: _TableMetadataUpdateContext) -> TableMetadata:
+    for sort in base_metadata.sort_orders:
+        # Only raise in case of a discrepancy
+        if sort.order_id == update.sort_order.order_id and sort != update.sort_order:
+            raise ValueError(f"Sort-order with id {sort.order_id} already exists: {sort}")
+
     context.add_update(update)
     return base_metadata.model_copy(
         update={
@@ -632,6 +644,29 @@ def _(update: RemoveStatisticsUpdate, base_metadata: TableMetadata, context: _Ta
     context.add_update(update)
 
     return base_metadata.model_copy(update={"statistics": statistics})
+
+
+@_apply_table_update.register(SetPartitionStatisticsUpdate)
+def _(update: SetPartitionStatisticsUpdate, base_metadata: TableMetadata, context: _TableMetadataUpdateContext) -> TableMetadata:
+    partition_statistics = filter_statistics_by_snapshot_id(
+        base_metadata.partition_statistics, update.partition_statistics.snapshot_id
+    )
+    context.add_update(update)
+
+    return base_metadata.model_copy(update={"partition_statistics": partition_statistics + [update.partition_statistics]})
+
+
+@_apply_table_update.register(RemovePartitionStatisticsUpdate)
+def _(
+    update: RemovePartitionStatisticsUpdate, base_metadata: TableMetadata, context: _TableMetadataUpdateContext
+) -> TableMetadata:
+    if not any(part_stat.snapshot_id == update.snapshot_id for part_stat in base_metadata.partition_statistics):
+        raise ValueError(f"Partition Statistics with snapshot id {update.snapshot_id} does not exist")
+
+    statistics = filter_statistics_by_snapshot_id(base_metadata.partition_statistics, update.snapshot_id)
+    context.add_update(update)
+
+    return base_metadata.model_copy(update={"partition_statistics": statistics})
 
 
 def update_table_metadata(
@@ -751,9 +786,19 @@ class AssertRefSnapshotId(ValidatableTableRequirement):
     ref: str = Field(...)
     snapshot_id: Optional[int] = Field(default=None, alias="snapshot-id")
 
+    @model_serializer(mode="wrap")
+    def serialize_model(self, handler: ModelWrapSerializerWithoutInfo) -> dict[str, Any]:
+        partial_result = handler(self)
+        # Ensure "snapshot-id" is always present, even if value is None
+        return {**partial_result, "snapshot-id": self.snapshot_id}
+
     def validate(self, base_metadata: Optional[TableMetadata]) -> None:
         if base_metadata is None:
             raise CommitFailedException("Requirement failed: current table metadata is missing")
+        elif len(base_metadata.snapshots) == 0 and self.ref != MAIN_BRANCH:
+            raise CommitFailedException(
+                f"Requirement failed: Table has no snapshots and can only be written to the {MAIN_BRANCH} BRANCH."
+            )
         elif snapshot_ref := base_metadata.refs.get(self.ref):
             ref_type = snapshot_ref.snapshot_ref_type
             if self.snapshot_id is None:

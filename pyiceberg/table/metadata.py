@@ -36,7 +36,7 @@ from pyiceberg.table.sorting import (
     SortOrder,
     assign_fresh_sort_order_ids,
 )
-from pyiceberg.table.statistics import StatisticsFile
+from pyiceberg.table.statistics import PartitionStatisticsFile, StatisticsFile
 from pyiceberg.typedef import (
     EMPTY_DICT,
     IcebergBaseModel,
@@ -234,6 +234,14 @@ class TableMetadataCommonFields(IcebergBaseModel):
     table correctly. A table can contain many statistics files
     associated with different table snapshots."""
 
+    partition_statistics: List[PartitionStatisticsFile] = Field(alias="partition-statistics", default_factory=list)
+    """A optional list of partition statistics files.
+    Partition statistics are not required for reading or planning
+    and readers may ignore them. Each table snapshot may be associated
+    with at most one partition statistics file. A writer can optionally
+    write the partition statistics file during each write operation,
+    or it can also be computed on demand."""
+
     # validators
     @field_validator("properties", mode="before")
     def transform_properties_dict_value_to_str(cls, properties: Properties) -> Dict[str, str]:
@@ -299,8 +307,10 @@ class TableMetadataCommonFields(IcebergBaseModel):
 
         return snapshot_id
 
-    def snapshot_by_name(self, name: str) -> Optional[Snapshot]:
+    def snapshot_by_name(self, name: Optional[str]) -> Optional[Snapshot]:
         """Return the snapshot referenced by the given name or null if no such reference exists."""
+        if name is None:
+            name = MAIN_BRANCH
         if ref := self.refs.get(name):
             return self.snapshot_by_id(ref.snapshot_id)
         return None
@@ -561,13 +571,6 @@ class TableMetadataV3(TableMetadataCommonFields, IcebergBaseModel):
     """The table’s highest assigned sequence number, a monotonically
     increasing long that tracks the order of snapshots in a table."""
 
-    row_lineage: bool = Field(alias="row-lineage", default=False)
-    """Indicates that row-lineage is enabled on the table
-
-    For more information:
-    https://iceberg.apache.org/spec/?column-projection#row-lineage
-    """
-
     next_row_id: Optional[int] = Field(alias="next-row-id", default=None)
     """A long higher than all assigned row IDs; the next snapshot's `first-row-id`."""
 
@@ -590,6 +593,11 @@ def new_table_metadata(
 ) -> TableMetadata:
     from pyiceberg.table import TableProperties
 
+    # Remove format-version so it does not get persisted
+    format_version = int(properties.pop(TableProperties.FORMAT_VERSION, TableProperties.DEFAULT_FORMAT_VERSION))
+
+    schema.check_format_version_compatibility(format_version)
+
     fresh_schema = assign_fresh_schema_ids(schema)
     fresh_partition_spec = assign_fresh_partition_spec_ids(partition_spec, schema, fresh_schema)
     fresh_sort_order = assign_fresh_sort_order_ids(sort_order, schema, fresh_schema)
@@ -597,8 +605,6 @@ def new_table_metadata(
     if table_uuid is None:
         table_uuid = uuid.uuid4()
 
-    # Remove format-version so it does not get persisted
-    format_version = int(properties.pop(TableProperties.FORMAT_VERSION, TableProperties.DEFAULT_FORMAT_VERSION))
     if format_version == 1:
         return TableMetadataV1(
             location=location,

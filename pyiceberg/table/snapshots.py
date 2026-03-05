@@ -58,6 +58,7 @@ TOTAL_RECORDS = "total-records"
 TOTAL_FILE_SIZE = "total-files-size"
 CHANGED_PARTITION_COUNT_PROP = "changed-partition-count"
 CHANGED_PARTITION_PREFIX = "partitions."
+PARTITION_SUMMARY_PROP = "partition-summaries-included"
 OPERATION = "operation"
 
 INITIAL_SEQUENCE_NUMBER = 0
@@ -272,10 +273,10 @@ class SnapshotSummaryCollector:
     partition_metrics: DefaultDict[str, UpdateMetrics]
     max_changed_partitions_for_summaries: int
 
-    def __init__(self) -> None:
+    def __init__(self, partition_summary_limit: int = 0) -> None:
         self.metrics = UpdateMetrics()
         self.partition_metrics = defaultdict(UpdateMetrics)
-        self.max_changed_partitions_for_summaries = 0
+        self.max_changed_partitions_for_summaries = partition_summary_limit
 
     def set_partition_summary_limit(self, limit: int) -> None:
         self.max_changed_partitions_for_summaries = limit
@@ -306,6 +307,8 @@ class SnapshotSummaryCollector:
         changed_partitions_size = len(self.partition_metrics)
         set_when_positive(properties, changed_partitions_size, CHANGED_PARTITION_COUNT_PROP)
         if changed_partitions_size <= self.max_changed_partitions_for_summaries:
+            if changed_partitions_size > 0:
+                properties[PARTITION_SUMMARY_PROP] = "true"
             for partition_path, update_metrics_partition in self.partition_metrics.items():
                 if (summary := self._partition_summary(update_metrics_partition)) and len(summary) != 0:
                     properties[CHANGED_PARTITION_PREFIX + partition_path] = summary
@@ -435,3 +438,16 @@ def ancestors_of(current_snapshot: Optional[Snapshot], table_metadata: TableMeta
         if snapshot.parent_snapshot_id is None:
             break
         snapshot = table_metadata.snapshot_by_id(snapshot.parent_snapshot_id)
+
+
+def ancestors_between(
+    from_snapshot: Optional[Snapshot], to_snapshot: Snapshot, table_metadata: TableMetadata
+) -> Iterable[Snapshot]:
+    """Get the ancestors of and including the given snapshot between the to and from snapshots."""
+    if from_snapshot is not None:
+        for snapshot in ancestors_of(to_snapshot, table_metadata):
+            yield snapshot
+            if snapshot == from_snapshot:
+                break
+    else:
+        yield from ancestors_of(to_snapshot, table_metadata)
