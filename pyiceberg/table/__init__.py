@@ -24,7 +24,6 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from functools import cached_property, wraps
 from itertools import chain
-from logging import getLogger
 from types import TracebackType
 from typing import (
     TYPE_CHECKING,
@@ -270,7 +269,7 @@ class Transaction:
     _autocommit: bool
     _updates: Tuple[TableUpdate, ...]
     _requirements: Tuple[TableRequirement, ...]
-    _snapshot_operations: Tuple[UpdateTableMetadata, ...]
+    _snapshot_operations: Tuple[UpdateTableMetadata[Any], ...]
 
     def __init__(self, table: Table, autocommit: bool = False):
         """Open a transaction to stage and commit changes to a table.
@@ -958,13 +957,12 @@ class Transaction:
         Returns:
             The table with the updates applied.
         """
-
         min_wait_ms = int(self.table_metadata.properties.get(COMMIT_MIN_RETRY_WAIT_MS, COMMIT_MIN_RETRY_WAIT_MS_DEFAULT))
         max_wait_ms = int(self.table_metadata.properties.get(COMMIT_MAX_RETRY_WAIT_MS, COMMIT_MAX_RETRY_WAIT_MS_DEFAULT))
         num_retries = int(self.table_metadata.properties.get(COMMIT_NUM_RETRIES, COMMIT_NUM_RETRIES_DEFAULT))
         timeout_ms = int(self.table_metadata.properties.get(COMMIT_RETRY_TOTAL_TIMEOUT_MS, COMMIT_RETRY_TOTAL_TIMEOUT_MS_DEFAULT))
 
-        def _before_attempt(state: RetryCallState):
+        def _before_attempt(state: RetryCallState) -> None:
             if state.attempt_number > 1:
                 namespace, table = self._table.name()
                 logger.debug(
@@ -975,9 +973,9 @@ class Transaction:
                 for op in self._snapshot_operations:
                     op._cleanup_commit_failure()
                     self._apply(*op._commit())
-            logger.debug(f"Committing transaction...")
+            logger.debug("Committing transaction...")
 
-        def _error_callback(state: RetryCallState):
+        def _error_callback(state: RetryCallState) -> None:
             msg = (
                 f"Failed to commit transaction after {state.attempt_number:,} attempts."
                 f" Try increasing the value of the `{COMMIT_NUM_RETRIES}` property on your table."
@@ -996,7 +994,7 @@ class Transaction:
             before=_before_attempt,
             retry_error_callback=_error_callback,
         )
-        def _commit_transaction():
+        def _commit_transaction() -> Table:
             if len(self._updates) > 0:
                 self._requirements += (AssertTableUUID(uuid=self.table_metadata.table_uuid),)
                 self._table._do_commit(  # pylint: disable=W0212
@@ -1936,13 +1934,11 @@ class DataScan(TableScan):
         # The lambda created here is run in multiple threads.
         # So we avoid creating _EvaluatorExpression methods bound to a single
         # shared instance across multiple threads.
-        return lambda datafile: (
-            residual_evaluator_of(
-                spec=spec,
-                expr=self.bound_filter,
-                case_sensitive=self.case_sensitive,
-                schema=self.table_metadata.schema(),
-            )
+        return lambda datafile: residual_evaluator_of(
+            spec=spec,
+            expr=self.bound_filter,
+            case_sensitive=self.case_sensitive,
+            schema=self.table_metadata.schema(),
         )
 
     @staticmethod

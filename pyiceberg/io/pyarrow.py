@@ -1583,7 +1583,8 @@ def _task_to_record_batches(
 
             # Inject projected column values if available
             if should_project_columns:
-                for name, value in projected_missing_fields.items():
+                for field_id, value in projected_missing_fields.items():
+                    name = projected_schema.find_field(field_id).name
                     index = result_batch.schema.get_field_index(name)
                     if index != -1:
                         arr = pa.repeat(value, result_batch.num_rows)

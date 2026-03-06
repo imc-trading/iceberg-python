@@ -17,11 +17,11 @@
 from __future__ import annotations
 
 import itertools
-from logging import getLogger
 import uuid
 from abc import ABC, abstractmethod
 from datetime import datetime
 from functools import singledispatch, wraps
+from logging import getLogger
 from typing import TYPE_CHECKING, Annotated, Any, Dict, Generic, List, Literal, Optional, Tuple, TypeVar, Union, cast
 
 from pydantic import Field, field_validator, model_serializer, model_validator
@@ -126,7 +126,6 @@ class UpdateTableMetadata(ABC, Generic[U]):
 
     def _cleanup_commit_failure(self) -> None:
         """Prepare the snapshot producer to commit against the latest version of the table after it has been updated."""
-        pass
 
     def __exit__(self, _: Any, value: Any, traceback: Any) -> None:
         """Close and commit the change."""

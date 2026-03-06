@@ -512,7 +512,7 @@ class HiveCatalog(MetastoreCatalog):
                 )
 
         if not self._lock_check_retries:
-            raise CommitFailedException(f"Lock was not acquired for commit and retries are set to `0`.")
+            raise CommitFailedException("Lock was not acquired for commit and retries are set to `0`.")
 
         return _do_wait_for_lock()
 

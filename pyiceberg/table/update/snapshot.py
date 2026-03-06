@@ -322,10 +322,10 @@ class _SnapshotProducer(UpdateTableMetadata[U], Generic[U]):
                 ),
             )
 
-    def _cleanup_commit_failure(self, commit_uuid: uuid.UUID | None = None) -> None:
+    def _cleanup_commit_failure(self) -> None:
         super()._cleanup_commit_failure()
         self._manifest_num_counter = itertools.count(0)
-        self.commit_uuid = commit_uuid or uuid.uuid4()
+        self.commit_uuid = uuid.uuid4()
         self._snapshot_id = self._transaction.table_metadata.new_snapshot_id()
         self._parent_snapshot_id = (
             snapshot.snapshot_id if (snapshot := self._transaction.table_metadata.snapshot_by_name(self._target_branch)) else None
