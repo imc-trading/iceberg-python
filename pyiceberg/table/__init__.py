@@ -1417,27 +1417,6 @@ class Table:
                 branch=branch,
             )
 
-                update_row_cnt = len(rows_to_update)
-
-                if len(rows_to_update) > 0:
-                    # build the match predicate filter
-                    overwrite_mask_predicate = upsert_util.create_match_filter(rows_to_update, join_cols)
-
-                    tx.overwrite(rows_to_update, overwrite_filter=overwrite_mask_predicate)
-
-            if when_not_matched_insert_all:
-                expr_match = upsert_util.create_match_filter(matched_iceberg_table, join_cols)
-                expr_match_bound = bind(self.schema(), expr_match, case_sensitive=case_sensitive)
-                expr_match_arrow = expression_to_pyarrow(expr_match_bound)
-                rows_to_insert = df.filter(~expr_match_arrow)
-
-                insert_row_cnt = len(rows_to_insert)
-
-                if insert_row_cnt > 0:
-                    tx.append(rows_to_insert)
-
-        return UpsertResult(rows_updated=update_row_cnt, rows_inserted=insert_row_cnt)
-
     def append(self, df: pa.Table, snapshot_properties: Dict[str, str] = EMPTY_DICT, branch: Optional[str] = MAIN_BRANCH) -> None:
         """
         Shorthand API for appending a PyArrow table to the table.

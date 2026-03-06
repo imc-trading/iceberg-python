@@ -1515,12 +1515,6 @@ def _task_to_record_batches(
             task.file, projected_schema, partition_spec, file_schema.field_ids
         )
 
-        # Apply column projection rules
-        # https://iceberg.apache.org/spec/#column-projection
-        should_project_columns, projected_missing_fields = _get_column_projection_values(
-            task.file, projected_schema, partition_spec, file_schema.field_ids
-        )
-
         pyarrow_filter = None
         if bound_row_filter is not AlwaysTrue():
             evaluated_projected_columns_filter = evaluate_projected_columns(
@@ -1583,6 +1577,9 @@ def _task_to_record_batches(
                 downcast_ns_timestamp_to_us=downcast_ns_timestamp_to_us,
                 projected_missing_fields=projected_missing_fields,
             )
+
+            project_schema_diff = projected_schema.field_ids.difference(file_schema.field_ids)
+            should_project_columns = len(project_schema_diff) > 0 and partition_spec is not None
 
             # Inject projected column values if available
             if should_project_columns:
