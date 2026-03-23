@@ -46,6 +46,7 @@ class ErrorResponseMessage(IcebergBaseModel):
     message: str = Field()
     type: str = Field()
     code: int = Field()
+    stack: Optional[list[str]] = Field(default=None)
 
 
 class ErrorResponse(IcebergBaseModel):
@@ -100,6 +101,9 @@ def _handle_non_200_response(exc: HTTPError, error_handler: Dict[int, Type[Excep
         else:
             error = ErrorResponse.model_validate_json(exc.response.text).error
             response = f"{error.type}: {error.message}"
+
+            if exception in (ServerError,):
+                response += f". Stack trace: \n{''.join(error.stack or [])}"
     except JSONDecodeError:
         # In the case we don't have a proper response
         response = f"RESTError {exc.response.status_code}: Could not decode json payload: {exc.response.text}"

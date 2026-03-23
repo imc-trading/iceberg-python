@@ -819,6 +819,34 @@ def test_namespace_exists_500(rest_mock: Mocker) -> None:
         catalog.namespace_exists("fokko")
 
 
+def test_namespace_exists_500_includes_stack_trace(rest_mock: Mocker) -> None:
+    rest_mock.head(
+        f"{TEST_URI}v1/namespaces/fokko",
+        json={
+            "error": {
+                "message": "Unknown failure",
+                "type": "UncheckedSQLException",
+                "code": 500,
+                "stack": [
+                    "UncheckedSQLException: Unknown failure\n",
+                    "\tat com.example.DB.query(DB.java:42)\n",
+                    "\tat com.example.Catalog.namespaceExists(Catalog.java:10)\n",
+                ],
+            }
+        },
+        status_code=500,
+        request_headers=TEST_HEADERS,
+    )
+    catalog = RestCatalog("rest", uri=TEST_URI, token=TEST_TOKEN)
+
+    with pytest.raises(ServerError) as exc_info:
+        catalog.namespace_exists("fokko")
+
+    assert "UncheckedSQLException: Unknown failure" in str(exc_info.value)
+    assert "Stack trace:" in str(exc_info.value)
+    assert "com.example.DB.query" in str(exc_info.value)
+
+
 def test_update_namespace_properties_404(rest_mock: Mocker) -> None:
     rest_mock.post(
         f"{TEST_URI}v1/namespaces/fokko/properties",
