@@ -127,6 +127,14 @@ class UpsertResult:
     rows_inserted: int = 0
 
 
+@dataclass()
+class MergeResult:
+    """Summary of the merge operation."""
+
+    rows_deleted: int = 0
+    rows_inserted: int = 0
+
+
 class TableProperties:
     PARQUET_ROW_GROUP_SIZE_BYTES = "write.parquet.row-group-size-bytes"
     PARQUET_ROW_GROUP_SIZE_BYTES_DEFAULT = 128 * 1024 * 1024  # 128 MB
@@ -969,6 +977,152 @@ class Transaction:
         )
         return [entry.data_file.file_path for entry in entries]
 
+    def merge(
+        self,
+        df: pa.Table,
+        join_cols: list[str],
+        snapshot_properties: dict[str, str] = EMPTY_DICT,
+        branch: str | None = MAIN_BRANCH,
+        check_duplicate_keys: bool = False,
+    ) -> MergeResult:
+        """Atomic delete-insert merge by join columns.
+
+        Deletes all target rows matching the source data's join column
+        values and inserts the source rows, all in a single OVERWRITE
+        snapshot.
+
+        Uses per-column ``In`` filters for file pruning (O(sum of
+        cardinalities) instead of O(product)), then an in-memory
+        anti-join for row-level correctness.
+
+        Unlike ``upsert()``, does not enforce uniqueness on source or
+        target by default.
+
+        Args:
+            df: The Arrow dataframe containing replacement rows.
+            join_cols: Columns used to match source rows against target rows.
+            snapshot_properties: Custom properties to be added to the snapshot summary.
+            branch: Branch reference to run the operation.
+            check_duplicate_keys: If True, raise ValueError when the source
+                data contains duplicate key tuples based on the join columns.
+                This is a data quality guard, not a correctness requirement -
+                merge() produces correct results with duplicate keys.
+
+        Returns:
+            A MergeResult with row counts (deleted from target, inserted from source).
+        """
+        try:
+            import pyarrow as pa
+            import pyarrow.compute as pc
+        except ModuleNotFoundError as e:
+            raise ModuleNotFoundError("For writes PyArrow needs to be installed") from e
+
+        import functools
+
+        from pyiceberg.expressions import In
+        from pyiceberg.io.pyarrow import ArrowScan, _check_pyarrow_schema_compatible, _dataframe_to_data_files
+        from pyiceberg.table import upsert_util
+
+        if not isinstance(df, pa.Table):
+            raise ValueError(f"Expected PyArrow table, got: {df}")
+
+        if not join_cols:
+            raise ValueError("join_cols must be a non-empty list of column names.")
+
+        missing = set(join_cols) - set(df.column_names)
+        if missing:
+            raise ValueError(f"join_cols not found in source data: {missing}")
+
+        if df.num_rows == 0:
+            return MergeResult()
+
+        if check_duplicate_keys and upsert_util.has_duplicate_rows(df, join_cols):
+            raise ValueError("Duplicate rows found in source data based on join columns.")
+
+        downcast_ns = Config().get_bool(DOWNCAST_NS_TIMESTAMP_TO_US_ON_WRITE) or False
+        _check_pyarrow_schema_compatible(
+            self.table_metadata.schema(),
+            provided_schema=df.schema,
+            downcast_ns_timestamp_to_us=downcast_ns,
+            format_version=self.table_metadata.format_version,
+        )
+
+        # Cast join cols on both sides to the canonical iceberg-derived
+        # Arrow types (StringType -> large_string, BinaryType -> large_binary,
+        # etc.) before building the In filter and the anti-join.  pa.Table.join
+        # is strict about the string/large_string and binary/large_binary
+        # variant pair even though both are semantically the same Iceberg
+        # type; the source and target can disagree on physical encoding
+        # depending on how each was constructed (pandas->arrow typically
+        # produces the small variant; parquet metadata can dictate either).
+        # Normalize both to the iceberg-derived form so the join is well-defined.
+        iceberg_arrow_schema = self.table_metadata.schema().as_arrow()
+
+        def _cast_join_cols(t: pa.Table) -> pa.Table:
+            return t.cast(pa.schema([iceberg_arrow_schema.field(f.name) if f.name in join_cols else f for f in t.schema]))
+
+        df = _cast_join_cols(df)
+
+        # Step 1: Build per-column In filters for file pruning.
+        # O(sum of cardinalities) instead of O(product).
+        # Over-approximates the match set, which is fine - row-level
+        # correctness is enforced by the anti-join in step 3.
+        in_filters: list[BooleanExpression] = [In(col, pc.unique(df[col]).to_pylist()) for col in join_cols]
+        candidate_filter: BooleanExpression = functools.reduce(And, in_filters)
+
+        # Step 2: Find candidate files via manifest pruning.
+        scan = self._scan(row_filter=candidate_filter, case_sensitive=True)
+        if branch is not None and branch in self.table_metadata.refs:
+            scan = scan.use_ref(branch)
+        tasks = list(scan.plan_files())
+
+        if not tasks:
+            # No files overlap - just append.
+            self.append(df, snapshot_properties=snapshot_properties, branch=branch)
+            return MergeResult(rows_inserted=df.num_rows)
+
+        # Step 3: Read ALL rows from candidate files, anti-join to keep
+        # non-matching rows.  The candidate_filter was only for file
+        # pruning - row-level correctness comes from the anti-join.
+        arrow_scan = ArrowScan(
+            self.table_metadata,
+            self._table.io,
+            projected_schema=self.table_metadata.schema(),
+            row_filter=ALWAYS_TRUE,
+            case_sensitive=True,
+        )
+        target_data = _cast_join_cols(arrow_scan.to_table(tasks))
+        source_keys = df.select(join_cols)
+
+        kept_rows = target_data.join(source_keys, keys=join_cols, join_type="left anti")
+        rows_deleted = target_data.num_rows - kept_rows.num_rows
+        # ``ArrowScan.to_table()`` can return text/binary columns as the
+        # ``large_*`` PyArrow variants (utf8 vs large_utf8, binary vs
+        # large_binary) while the user-provided ``df`` from pandas->arrow
+        # typically produces the non-large variants. Both sides are
+        # semantically the same Iceberg type; the difference is purely
+        # PyArrow physical encoding. ``promote_options="default"`` refuses
+        # to bridge that gap and the concat fails. Use ``"permissive"`` to
+        # match what ``pyiceberg/io/pyarrow.py:to_table()`` already does
+        # for the same reason ("different batches can use different
+        # schema's (due to large_ types)").
+        new_content = pa.concat_tables([kept_rows, df], promote_options="permissive")
+
+        # Step 4: Atomic single-snapshot commit.
+        # Delete old files, append rewritten content.
+        with self.update_snapshot(snapshot_properties=snapshot_properties, branch=branch).overwrite() as overwrite_op:
+            for task in tasks:
+                overwrite_op.delete_data_file(task.file)
+            for data_file in _dataframe_to_data_files(
+                table_metadata=self.table_metadata,
+                df=new_content,
+                io=self._table.io,
+                write_uuid=overwrite_op.commit_uuid,
+            ):
+                overwrite_op.append_data_file(data_file)
+
+        return MergeResult(rows_deleted=rows_deleted, rows_inserted=df.num_rows)
+
     def add_files(
         self,
         file_paths: list[str],
@@ -1530,6 +1684,40 @@ class Table:
                 case_sensitive=case_sensitive,
                 branch=branch,
                 snapshot_properties=snapshot_properties,
+            )
+
+    def merge(
+        self,
+        df: pa.Table,
+        join_cols: list[str],
+        snapshot_properties: dict[str, str] = EMPTY_DICT,
+        branch: str | None = MAIN_BRANCH,
+        check_duplicate_keys: bool = False,
+    ) -> MergeResult:
+        """Atomic delete-insert merge by join columns.
+
+        Unlike ``upsert()``, does not enforce uniqueness on source or
+        target by default.
+
+        Args:
+            df: The Arrow dataframe containing replacement rows.
+            join_cols: Columns used to match source rows against target rows.
+            snapshot_properties: Custom properties to be added to the snapshot summary.
+            branch: Branch reference to run the operation.
+            check_duplicate_keys: If True, raise ValueError when the source
+                data contains duplicate key tuples based on the join columns.
+                This is a data quality guard, not a correctness requirement.
+
+        Returns:
+            A MergeResult with row counts (deleted from target, inserted from source).
+        """
+        with self.transaction() as tx:
+            return tx.merge(
+                df=df,
+                join_cols=join_cols,
+                snapshot_properties=snapshot_properties,
+                branch=branch,
+                check_duplicate_keys=check_duplicate_keys,
             )
 
     def append(
