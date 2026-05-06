@@ -472,16 +472,24 @@ def test_merge_check_duplicate_keys_raises(catalog: Catalog) -> None:
     _drop(catalog, ident)
     tbl = catalog.create_table(ident, schema=SCHEMA)
 
-    tbl.append(pa.Table.from_pylist([
-        {"user_id": 1, "name": "Alice", "score": 100},
-    ], schema=ARROW))
+    tbl.append(
+        pa.Table.from_pylist(
+            [
+                {"user_id": 1, "name": "Alice", "score": 100},
+            ],
+            schema=ARROW,
+        )
+    )
 
     with pytest.raises(ValueError, match="Duplicate rows"):
         tbl.merge(
-            pa.Table.from_pylist([
-                {"user_id": 1, "name": "Alice V1", "score": 150},
-                {"user_id": 1, "name": "Alice V2", "score": 200},
-            ], schema=ARROW),
+            pa.Table.from_pylist(
+                [
+                    {"user_id": 1, "name": "Alice V1", "score": 150},
+                    {"user_id": 1, "name": "Alice V2", "score": 200},
+                ],
+                schema=ARROW,
+            ),
             join_cols=["user_id"],
             check_duplicate_keys=True,
         )
@@ -493,15 +501,23 @@ def test_merge_check_duplicate_keys_allows_unique(catalog: Catalog) -> None:
     _drop(catalog, ident)
     tbl = catalog.create_table(ident, schema=SCHEMA)
 
-    tbl.append(pa.Table.from_pylist([
-        {"user_id": 1, "name": "Alice", "score": 100},
-    ], schema=ARROW))
+    tbl.append(
+        pa.Table.from_pylist(
+            [
+                {"user_id": 1, "name": "Alice", "score": 100},
+            ],
+            schema=ARROW,
+        )
+    )
 
     tbl.merge(
-        pa.Table.from_pylist([
-            {"user_id": 1, "name": "Alice", "score": 150},
-            {"user_id": 2, "name": "Bob", "score": 200},
-        ], schema=ARROW),
+        pa.Table.from_pylist(
+            [
+                {"user_id": 1, "name": "Alice", "score": 150},
+                {"user_id": 2, "name": "Bob", "score": 200},
+            ],
+            schema=ARROW,
+        ),
         join_cols=["user_id"],
         check_duplicate_keys=True,
     )
@@ -517,15 +533,23 @@ def test_merge_default_allows_duplicate_keys(catalog: Catalog) -> None:
     _drop(catalog, ident)
     tbl = catalog.create_table(ident, schema=SCHEMA)
 
-    tbl.append(pa.Table.from_pylist([
-        {"user_id": 1, "name": "Alice", "score": 100},
-    ], schema=ARROW))
+    tbl.append(
+        pa.Table.from_pylist(
+            [
+                {"user_id": 1, "name": "Alice", "score": 100},
+            ],
+            schema=ARROW,
+        )
+    )
 
     tbl.merge(
-        pa.Table.from_pylist([
-            {"user_id": 1, "name": "Alice V1", "score": 150},
-            {"user_id": 1, "name": "Alice V2", "score": 200},
-        ], schema=ARROW),
+        pa.Table.from_pylist(
+            [
+                {"user_id": 1, "name": "Alice V1", "score": 150},
+                {"user_id": 1, "name": "Alice V2", "score": 200},
+            ],
+            schema=ARROW,
+        ),
         join_cols=["user_id"],
     )
 
