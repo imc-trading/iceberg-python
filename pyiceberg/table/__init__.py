@@ -996,7 +996,17 @@ class Transaction:
 
         kept_rows = target_data.join(source_keys, keys=join_cols, join_type="left anti")
         rows_deleted = target_data.num_rows - kept_rows.num_rows
-        new_content = pa.concat_tables([kept_rows, df], promote_options="default")
+        # ``ArrowScan.to_table()`` can return text/binary columns as the
+        # ``large_*`` PyArrow variants (utf8 vs large_utf8, binary vs
+        # large_binary) while the user-provided ``df`` from pandas->arrow
+        # typically produces the non-large variants. Both sides are
+        # semantically the same Iceberg type; the difference is purely
+        # PyArrow physical encoding. ``promote_options="default"`` refuses
+        # to bridge that gap and the concat fails. Use ``"permissive"`` to
+        # match what ``pyiceberg/io/pyarrow.py:to_table()`` already does
+        # for the same reason ("different batches can use different
+        # schema's (due to large_ types)").
+        new_content = pa.concat_tables([kept_rows, df], promote_options="permissive")
 
         # Step 4: Atomic single-snapshot commit.
         # Delete old files, append rewritten content.
