@@ -107,6 +107,7 @@ from pyiceberg.io import (
     HDFS_HOST,
     HDFS_KERB_TICKET,
     HDFS_PORT,
+    HDFS_REPLICATION,
     HDFS_USER,
     PYARROW_USE_LARGE_TYPES_ON_READ,
     S3_ACCESS_KEY_ID,
@@ -578,8 +579,10 @@ class PyArrowFileIO(FileIO):
         from pyarrow.fs import HadoopFileSystem
 
         hdfs_kwargs: Dict[str, Any] = {}
+        replication = self.properties.get(HDFS_REPLICATION, "3")
+        hdfs_kwargs["replication"] = int(replication)
         if netloc:
-            return HadoopFileSystem.from_uri(f"{scheme}://{netloc}")
+            return HadoopFileSystem.from_uri(f"{scheme}://{netloc}/?replication={replication}")
         if host := self.properties.get(HDFS_HOST):
             hdfs_kwargs["host"] = host
         if port := self.properties.get(HDFS_PORT):
