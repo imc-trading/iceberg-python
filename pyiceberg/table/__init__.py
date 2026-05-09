@@ -952,9 +952,14 @@ class Transaction:
         if df.num_rows == 0:
             return MergeResult()
 
-        if check_duplicate_keys and upsert_util.has_duplicate_rows(df, join_cols):
-            raise ValueError("Duplicate rows found in source data based on join columns.")
+        # Validation order: structural -> semantic (schema) -> data-quality
+        # (NULL/NaN) -> data-quality (duplicates). This ensures that the
+        # most actionable error fires first - schema mismatches are usually
+        # programmer errors that must be fixed before data cleanup matters.
 
+        # 1. Schema: source's column types must be compatible with the
+        #    iceberg schema. Catches programmer-side mistakes (wrong types,
+        #    extra/missing columns) before any data-content scans run.
         downcast_ns = Config().get_bool(DOWNCAST_NS_TIMESTAMP_TO_US_ON_WRITE) or False
         _check_pyarrow_schema_compatible(
             self.table_metadata.schema(),
@@ -963,10 +968,44 @@ class Transaction:
             format_version=self.table_metadata.format_version,
         )
 
+        # 2. NULL / NaN in source join cols. Both have undefined equality
+        #    semantics:
+        #      * SQL three-valued logic: ``NULL = NULL`` is unknown.
+        #      * IEEE 754: ``NaN == NaN`` is false (every NaN is distinct).
+        #    Either way, the key cannot match anything in target -
+        #    accepting it would silently insert source rows alongside any
+        #    pre-existing target NULL/NaN rows, producing duplicates the
+        #    merge "couldn't" deduplicate. Iceberg's ``In`` predicate
+        #    rejects both NULL and NaN literals for the same reason.
+        #    Callers must coerce these to a sentinel value (e.g. ``""``,
+        #    ``0``, or a domain-specific marker) first.
+        null_join_cols = [col for col in join_cols if df[col].null_count > 0]
+        if null_join_cols:
+            raise ValueError(
+                f"Join column(s) contain NULL value(s) in source: {null_join_cols}. "
+                f"merge() requires non-null join keys (NULL has undefined equality semantics). "
+                f'Coerce NULLs to a sentinel value (e.g. "" or 0) before calling merge().'
+            )
+        nan_join_cols = [col for col in join_cols if pa.types.is_floating(df[col].type) and pc.any(pc.is_nan(df[col])).as_py()]
+        if nan_join_cols:
+            raise ValueError(
+                f"Join column(s) contain NaN value(s) in source: {nan_join_cols}. "
+                f"merge() requires non-NaN join keys (NaN != NaN per IEEE 754). "
+                f"Coerce NaN to a sentinel value before calling merge()."
+            )
+
+        # 3. Optional duplicate-key check (most expensive: a group_by).
+        #    Runs last so the cheaper, more diagnostic checks above fire
+        #    first if the source is genuinely malformed.
+        if check_duplicate_keys and upsert_util.has_duplicate_rows(df, join_cols):
+            raise ValueError("Duplicate rows found in source data based on join columns.")
+
         # Step 1: Build per-column In filters for file pruning.
         # O(sum of cardinalities) instead of O(product).
         # Over-approximates the match set, which is fine - row-level
         # correctness is enforced by the anti-join in step 3.
+        # Source is validated non-null on join cols above, so the
+        # In-literal construction can never see ``None``.
         in_filters: list[BooleanExpression] = [In(col, pc.unique(df[col]).to_pylist()) for col in join_cols]
         candidate_filter: BooleanExpression = functools.reduce(And, in_filters)
 
@@ -992,11 +1031,76 @@ class Transaction:
             case_sensitive=True,
         )
         target_data = arrow_scan.to_table(tasks)
+
+        # Reject NULL and NaN values in target join columns. Same
+        # rationale as the source-side check above - both have undefined
+        # equality semantics and would break the "merge by join columns"
+        # contract. They were almost certainly written before this
+        # validation was added (or by another path); silently leaving
+        # them in place would be misleading because the left-anti-join
+        # will preserve them. Surface the bad data clearly so the caller
+        # can clean it up rather than letting it accumulate.
+        target_null_cols = [col for col in join_cols if target_data.column(col).null_count > 0]
+        if target_null_cols:
+            raise ValueError(
+                f"Join column(s) contain NULL value(s) in target: {target_null_cols}. "
+                f"merge() requires non-null join keys on both sides. Existing target rows with "
+                f"NULL keys must be cleaned up (e.g. via delete()) before merge() can run."
+            )
+        target_nan_cols = [
+            col
+            for col in join_cols
+            if pa.types.is_floating(target_data.column(col).type) and pc.any(pc.is_nan(target_data.column(col))).as_py()
+        ]
+        if target_nan_cols:
+            raise ValueError(
+                f"Join column(s) contain NaN value(s) in target: {target_nan_cols}. "
+                f"merge() requires non-NaN join keys on both sides. Existing target rows with "
+                f"NaN keys must be cleaned up before merge() can run."
+            )
+
         source_keys = df.select(join_cols)
+
+        # Normalize join-column physical encoding between target_data
+        # (from ArrowScan) and source_keys before delegating to pyarrow's
+        # strict ``Table.join``. ArrowScan and a user-built df can
+        # disagree on the ``string`` vs ``large_string`` (and binary
+        # equivalents) variant - both are semantically the same Iceberg
+        # type but pyarrow.join refuses to bridge them. Use
+        # ``pa.unify_schemas`` with ``permissive`` promotion to always
+        # widen to the larger variant; this never truncates (whereas a
+        # one-sided cast in either direction can fail when narrowing a
+        # value that exceeds the smaller offset width). Same mechanism
+        # is used in ``pyiceberg/io/pyarrow.py`` for the same reason.
+        target_keys_schema = target_data.select(join_cols).schema
+        if target_keys_schema != source_keys.schema:
+            unified_join_schema = pa.unify_schemas(
+                [target_keys_schema, source_keys.schema],
+                promote_options="permissive",
+            )
+            source_keys = source_keys.cast(unified_join_schema)
+            target_data = target_data.cast(
+                pa.schema(
+                    [
+                        unified_join_schema.field(name) if name in join_cols else target_data.schema.field(name)
+                        for name in target_data.schema.names
+                    ]
+                )
+            )
 
         kept_rows = target_data.join(source_keys, keys=join_cols, join_type="left anti")
         rows_deleted = target_data.num_rows - kept_rows.num_rows
-        new_content = pa.concat_tables([kept_rows, df], promote_options="default")
+        # ``ArrowScan.to_table()`` can return text/binary columns as the
+        # ``large_*`` PyArrow variants (utf8 vs large_utf8, binary vs
+        # large_binary) while the user-provided ``df`` from pandas->arrow
+        # typically produces the non-large variants. Both sides are
+        # semantically the same Iceberg type; the difference is purely
+        # PyArrow physical encoding. ``promote_options="default"`` refuses
+        # to bridge that gap and the concat fails. Use ``"permissive"`` to
+        # match what ``pyiceberg/io/pyarrow.py:to_table()`` already does
+        # for the same reason ("different batches can use different
+        # schema's (due to large_ types)").
+        new_content = pa.concat_tables([kept_rows, df], promote_options="permissive")
 
         # Step 4: Atomic single-snapshot commit.
         # Delete old files, append rewritten content.
