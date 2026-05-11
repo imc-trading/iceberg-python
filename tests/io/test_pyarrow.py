@@ -366,6 +366,20 @@ def test_deleting_hdfs_file_not_found() -> None:
         assert "Cannot delete file, does not exist:" in str(exc_info.value)
 
 
+def test_hdfs_replication_default() -> None:
+    with patch("pyarrow.fs.HadoopFileSystem") as mock_hdfs:
+        PyArrowFileIO()._initialize_hdfs_fs("hdfs", None)
+
+        mock_hdfs.assert_called_once_with(replication=3)
+
+
+def test_hdfs_replication_from_property() -> None:
+    with patch("pyarrow.fs.HadoopFileSystem") as mock_hdfs:
+        PyArrowFileIO({"hdfs.replication": "2"})._initialize_hdfs_fs("hdfs", None)
+
+        mock_hdfs.assert_called_once_with(replication=2)
+
+
 def test_pyarrow_s3_session_properties() -> None:
     session_properties: Properties = {
         "s3.endpoint": "http://localhost:9000",
