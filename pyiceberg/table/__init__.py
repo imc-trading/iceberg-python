@@ -963,6 +963,22 @@ class Transaction:
             format_version=self.table_metadata.format_version,
         )
 
+        # Cast join cols on both sides to the canonical iceberg-derived
+        # Arrow types (StringType -> large_string, BinaryType -> large_binary,
+        # etc.) before building the In filter and the anti-join.  pa.Table.join
+        # is strict about the string/large_string and binary/large_binary
+        # variant pair even though both are semantically the same Iceberg
+        # type; the source and target can disagree on physical encoding
+        # depending on how each was constructed (pandas->arrow typically
+        # produces the small variant; parquet metadata can dictate either).
+        # Normalize both to the iceberg-derived form so the join is well-defined.
+        iceberg_arrow_schema = self.table_metadata.schema().as_arrow()
+
+        def _cast_join_cols(t: pa.Table) -> pa.Table:
+            return t.cast(pa.schema([iceberg_arrow_schema.field(f.name) if f.name in join_cols else f for f in t.schema]))
+
+        df = _cast_join_cols(df)
+
         # Step 1: Build per-column In filters for file pruning.
         # O(sum of cardinalities) instead of O(product).
         # Over-approximates the match set, which is fine - row-level
@@ -991,7 +1007,7 @@ class Transaction:
             row_filter=ALWAYS_TRUE,
             case_sensitive=True,
         )
-        target_data = arrow_scan.to_table(tasks)
+        target_data = _cast_join_cols(arrow_scan.to_table(tasks))
         source_keys = df.select(join_cols)
 
         kept_rows = target_data.join(source_keys, keys=join_cols, join_type="left anti")
