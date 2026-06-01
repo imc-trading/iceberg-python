@@ -2645,6 +2645,16 @@ def data_file_statistics_from_parquet_metadata(
     )
 
 
+def _resolve_row_group_size(arrow_table: pa.Table, row_group_limit: int | None, row_group_size_bytes: int | None) -> int | None:
+    if not row_group_size_bytes or arrow_table.num_rows == 0:
+        return row_group_limit
+    bytes_per_row = max(1, arrow_table.nbytes // arrow_table.num_rows)
+    rows_for_byte_budget = max(1, row_group_size_bytes // bytes_per_row)
+    if row_group_limit is None:
+        return rows_for_byte_budget
+    return min(row_group_limit, rows_for_byte_budget)
+
+
 class ParquetFormatWriter(FileFormatWriter):
     """Writes Arrow tables to a Parquet file."""
 
@@ -2655,10 +2665,15 @@ class ParquetFormatWriter(FileFormatWriter):
         self._writer: pq.ParquetWriter | None = None
         self._fos: OutputStream | None = None
         self._parquet_writer_kwargs = _get_parquet_writer_kwargs(properties)
-        self._row_group_size = property_as_int(
+        self._row_group_limit = property_as_int(
             properties=properties,
             property_name=TableProperties.PARQUET_ROW_GROUP_LIMIT,
             default=TableProperties.PARQUET_ROW_GROUP_LIMIT_DEFAULT,
+        )
+        self._row_group_size_bytes = property_as_int(
+            properties=properties,
+            property_name=TableProperties.PARQUET_ROW_GROUP_SIZE_BYTES,
+            default=TableProperties.PARQUET_ROW_GROUP_SIZE_BYTES_DEFAULT,
         )
 
     def write(self, table: pa.Table) -> None:
@@ -2675,7 +2690,10 @@ class ParquetFormatWriter(FileFormatWriter):
                 fos.close()
                 raise
             self._fos = fos
-        self._writer.write(table, row_group_size=self._row_group_size)
+        self._writer.write(
+            table,
+            row_group_size=_resolve_row_group_size(table, self._row_group_limit, self._row_group_size_bytes),
+        )
 
     def close(self) -> DataFileStatistics:
         if self._result is not None:
@@ -2926,7 +2944,6 @@ def _get_parquet_writer_kwargs(table_properties: Properties) -> dict[str, Any]:
     from pyiceberg.table import TableProperties
 
     for key_pattern in [
-        TableProperties.PARQUET_ROW_GROUP_SIZE_BYTES,
         TableProperties.PARQUET_BLOOM_FILTER_MAX_BYTES,
         f"{TableProperties.PARQUET_BLOOM_FILTER_COLUMN_ENABLED_PREFIX}.*",
     ]:
