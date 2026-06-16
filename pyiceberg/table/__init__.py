@@ -213,6 +213,9 @@ class TableProperties:
 
     PARQUET_BLOOM_FILTER_COLUMN_ENABLED_PREFIX = "write.parquet.bloom-filter-enabled.column"
 
+    PARQUET_WRITE_PAGE_INDEX = "write.parquet.write-page-index"
+    PARQUET_WRITE_PAGE_INDEX_DEFAULT = False
+
     WRITE_TARGET_FILE_SIZE_BYTES = "write.target-file-size-bytes"
     WRITE_TARGET_FILE_SIZE_BYTES_DEFAULT = 512 * 1024 * 1024  # 512 MB
 
