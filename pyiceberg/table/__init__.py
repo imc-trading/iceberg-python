@@ -31,6 +31,7 @@ from typing import (
     Callable,
     Dict,
     Iterable,
+    Iterator,
     List,
     Optional,
     Set,
@@ -278,6 +279,7 @@ class Transaction:
     _updates: Tuple[TableUpdate, ...]
     _requirements: Tuple[TableRequirement, ...]
     _snapshot_operations: Tuple[UpdateTableMetadata[Any], ...]
+    _written_data_file_locations: List[str]
 
     def __init__(self, table: Table, autocommit: bool = False):
         """Open a transaction to stage and commit changes to a table.
@@ -291,6 +293,7 @@ class Transaction:
         self._updates = ()
         self._requirements = ()
         self._snapshot_operations = ()
+        self._written_data_file_locations = []
 
     @property
     def table_metadata(self) -> TableMetadata:
@@ -306,6 +309,38 @@ class Transaction:
         """Close and commit the transaction if no exceptions have been raised."""
         if exctype is None and excinst is None and exctb is None:
             self.commit_transaction()
+        else:
+            self._discard_written_data_files()
+
+    def _track_written_data_files(self, data_files: Iterable[DataFile]) -> Iterator[DataFile]:
+        """Record data files written by this transaction, so an abandoned transaction can remove them.
+
+        Only files written *here* are recorded. Files handed to the transaction by a caller — through
+        `add_files`, or by appending a `DataFile` to a snapshot producer directly — belong to that
+        caller, which may well intend to reuse them across commit attempts.
+        """
+        for data_file in data_files:
+            self._written_data_file_locations.append(data_file.file_path)
+            yield data_file
+
+    def _discard_written_data_files(self) -> None:
+        """Delete the data files this transaction wrote but did not commit.
+
+        Without this, every abandoned attempt leaves its data files behind. They are referenced by no
+        snapshot, so expiring snapshots never reclaims them, and only a `delete-orphan-files`
+        maintenance run — which waits for files to age, since a file being written right now is
+        indistinguishable from a stale one — eventually will. A copy-on-write delete makes that
+        expensive: each attempt rewrites every file its predicate partly matched.
+
+        Only safe when the commit certainly did not land. `CommitStateUnknownException` means the
+        outcome is unknown and the files may be live table data, so those are left to age out.
+        """
+        for location in self._written_data_file_locations:
+            try:
+                self._table.io.delete(location)
+            except Exception:
+                logger.warning(f"Failed to delete uncommitted data file {location}", exc_info=True)
+        self._written_data_file_locations = []
 
     def _apply(self, updates: Tuple[TableUpdate, ...], requirements: Tuple[TableRequirement, ...] = ()) -> Transaction:
         """Check if the requirements are met, and applies the updates to the metadata."""
@@ -515,8 +550,10 @@ class Transaction:
 
         append_snapshot_commit_uuid = uuid.uuid4()
         data_files = list(
-            _dataframe_to_data_files(
-                table_metadata=self.table_metadata, write_uuid=append_snapshot_commit_uuid, df=df, io=self._table.io
+            self._track_written_data_files(
+                _dataframe_to_data_files(
+                    table_metadata=self.table_metadata, write_uuid=append_snapshot_commit_uuid, df=df, io=self._table.io
+                )
             )
         )
         with self._append_snapshot_producer(snapshot_properties, branch=branch) as append_files:
@@ -573,8 +610,10 @@ class Transaction:
 
         append_snapshot_commit_uuid = uuid.uuid4()
         data_files: List[DataFile] = list(
-            _dataframe_to_data_files(
-                table_metadata=self._table.metadata, write_uuid=append_snapshot_commit_uuid, df=df, io=self._table.io
+            self._track_written_data_files(
+                _dataframe_to_data_files(
+                    table_metadata=self._table.metadata, write_uuid=append_snapshot_commit_uuid, df=df, io=self._table.io
+                )
             )
         )
 
@@ -642,8 +681,10 @@ class Transaction:
         with self._append_snapshot_producer(snapshot_properties, branch=branch) as append_files:
             # skip writing data files if the dataframe is empty
             if df.shape[0] > 0:
-                data_files = _dataframe_to_data_files(
-                    table_metadata=self.table_metadata, write_uuid=append_files.commit_uuid, df=df, io=self._table.io
+                data_files = self._track_written_data_files(
+                    _dataframe_to_data_files(
+                        table_metadata=self.table_metadata, write_uuid=append_files.commit_uuid, df=df, io=self._table.io
+                    )
                 )
                 for data_file in data_files:
                     append_files.append_data_file(data_file)
@@ -725,12 +766,14 @@ class Transaction:
                         (
                             original_file.file,
                             list(
-                                _dataframe_to_data_files(
-                                    io=self._table.io,
-                                    df=filtered_df,
-                                    table_metadata=self.table_metadata,
-                                    write_uuid=commit_uuid,
-                                    counter=counter,
+                                self._track_written_data_files(
+                                    _dataframe_to_data_files(
+                                        io=self._table.io,
+                                        df=filtered_df,
+                                        table_metadata=self.table_metadata,
+                                        write_uuid=commit_uuid,
+                                        counter=counter,
+                                    )
                                 )
                             ),
                         )
@@ -1029,11 +1072,13 @@ class Transaction:
         with self.update_snapshot(snapshot_properties=snapshot_properties, branch=branch).overwrite() as overwrite_op:
             for task in tasks:
                 overwrite_op.delete_data_file(task.file)
-            for data_file in _dataframe_to_data_files(
-                table_metadata=self.table_metadata,
-                df=new_content,
-                io=self._table.io,
-                write_uuid=overwrite_op.commit_uuid,
+            for data_file in self._track_written_data_files(
+                _dataframe_to_data_files(
+                    table_metadata=self.table_metadata,
+                    df=new_content,
+                    io=self._table.io,
+                    write_uuid=overwrite_op.commit_uuid,
+                )
             ):
                 overwrite_op.append_data_file(data_file)
 
@@ -1161,7 +1206,18 @@ class Transaction:
 
             return self._table
 
-        return _commit_transaction()
+        try:
+            table = _commit_transaction()
+        except CommitFailedException:
+            # The catalog rejected the commit, so nothing references the data files written for it.
+            # Any other failure — `CommitStateUnknownException` above all — may have committed, and
+            # those files are left for orphan-file cleanup to age out rather than risk deleting live data.
+            self._discard_written_data_files()
+            raise
+
+        # Committed: the files are table data now, and must outlive this transaction.
+        self._written_data_file_locations = []
+        return table
 
 
 class CreateTableTransaction(Transaction):
