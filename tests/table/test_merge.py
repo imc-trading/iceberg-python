@@ -1418,7 +1418,7 @@ def test_merge_drift_with_unicode_key(catalog: Catalog, target_type: pa.DataType
     out = tbl.scan().to_arrow().sort_by("key")
     assert out.num_rows == 4
     assert sorted(out.column("key").to_pylist()) == sorted(["naïve", "日本語", "emoji-🚀", "café"])
-    rows_by_key = dict(zip(out.column("key").to_pylist(), out.column("value").to_pylist()))
+    rows_by_key = dict(zip(out.column("key").to_pylist(), out.column("value").to_pylist(), strict=True))
     assert rows_by_key["日本語"] == 99
     assert rows_by_key["naïve"] == 1
 
@@ -1455,7 +1455,7 @@ def test_merge_drift_with_long_string_key(catalog: Catalog, target_type: pa.Data
 
     out = tbl.scan().to_arrow().sort_by("key")
     assert out.num_rows == 2
-    rows_by_key = dict(zip(out.column("key").to_pylist(), out.column("value").to_pylist()))
+    rows_by_key = dict(zip(out.column("key").to_pylist(), out.column("value").to_pylist(), strict=True))
     assert rows_by_key[long_key] == 99
     assert rows_by_key[other] == 2
 
@@ -1492,7 +1492,7 @@ def test_merge_drift_with_empty_and_high_bit_binary_key(
     )
 
     out = tbl.scan().to_arrow()
-    rows_by_key = dict(zip(out.column("key").to_pylist(), out.column("value").to_pylist()))
+    rows_by_key = dict(zip(out.column("key").to_pylist(), out.column("value").to_pylist(), strict=True))
     assert rows_by_key[b""] == 0
     assert rows_by_key[b"\x00\x01\x02"] == 999
     assert rows_by_key[b"\xff\xfe\xfd"] == 2
@@ -1598,7 +1598,7 @@ def test_merge_drift_alternating_directions(catalog: Catalog) -> None:
         )
 
     out = tbl.scan().to_arrow().sort_by("key")
-    rows_by_key = dict(zip(out.column("key").to_pylist(), out.column("value").to_pylist()))
+    rows_by_key = dict(zip(out.column("key").to_pylist(), out.column("value").to_pylist(), strict=True))
     assert rows_by_key["a"] == 103  # last merge wins
     assert all(f"k{i}" in rows_by_key for i in range(4))
 
@@ -1787,7 +1787,7 @@ def test_merge_drift_with_multi_file_target(catalog: Catalog, target_type: pa.Da
     )
 
     out = tbl.scan().to_arrow()
-    rows_by_key = dict(zip(out.column("key").to_pylist(), out.column("value").to_pylist()))
+    rows_by_key = dict(zip(out.column("key").to_pylist(), out.column("value").to_pylist(), strict=True))
     assert rows_by_key["k0_a"] == 999
     assert rows_by_key["k1_b"] == 998
     assert rows_by_key["k2_a"] == 997
@@ -1937,7 +1937,7 @@ def test_merge_preserves_null_in_target_join_col(catalog: Catalog) -> None:
     tbl.merge(src, join_cols=["key"])
 
     out = tbl.scan().to_arrow()
-    rows = list(zip(out.column("key").to_pylist(), out.column("value").to_pylist()))
+    rows = list(zip(out.column("key").to_pylist(), out.column("value").to_pylist(), strict=True))
     # NULL row preserved, "a" row replaced.
     assert (None, 1) in rows
     assert ("a", 99) in rows
@@ -1974,7 +1974,7 @@ def test_merge_target_null_check_only_runs_when_files_are_candidates(catalog: Ca
     tbl.merge(src, join_cols=["key"])
 
     out = tbl.scan().to_arrow()
-    rows = list(zip(out.column("key").to_pylist(), out.column("value").to_pylist()))
+    rows = list(zip(out.column("key").to_pylist(), out.column("value").to_pylist(), strict=True))
     assert (None, 1) in rows  # File 1 untouched
     assert ("a", 99) in rows  # File 2 replaced
     assert len(rows) == 2
@@ -2027,7 +2027,7 @@ def test_merge_drift_preserves_nullable_flag_after_cast(catalog: Catalog) -> Non
 
     out = tbl.scan().to_arrow().sort_by("key")
     assert out.num_rows == 3
-    rows = list(zip(out.column("key").to_pylist(), out.column("tag").to_pylist(), out.column("value").to_pylist()))
+    rows = list(zip(out.column("key").to_pylist(), out.column("tag").to_pylist(), out.column("value").to_pylist(), strict=True))
     assert ("a", "updated", 99) in rows
     assert ("b", "x", 2) in rows
     assert ("c", None, 3) in rows
@@ -2070,7 +2070,7 @@ def test_merge_drift_symmetric_widen_does_not_truncate(catalog: Catalog) -> None
     tbl.merge(src, join_cols=["key"])
 
     out = tbl.scan().to_arrow()
-    rows = dict(zip(out.column("key").to_pylist(), out.column("value").to_pylist()))
+    rows = dict(zip(out.column("key").to_pylist(), out.column("value").to_pylist(), strict=True))
     assert rows["small"] == 11
     assert rows[long_value] == 99
     assert len([k for k in rows if k == long_value][0]) == 100_000  # not truncated
@@ -2236,7 +2236,7 @@ def test_merge_drift_with_source_columns_in_different_order(catalog: Catalog) ->
     )
 
     out = tbl.scan().to_arrow().sort_by("key")
-    rows = list(zip(out.column("key").to_pylist(), out.column("name").to_pylist(), out.column("value").to_pylist()))
+    rows = list(zip(out.column("key").to_pylist(), out.column("name").to_pylist(), out.column("value").to_pylist(), strict=True))
     assert ("a", "Alice2", 99) in rows
     assert ("b", "Bob", 2) in rows
     assert ("c", "Charlie", 3) in rows
@@ -2341,7 +2341,7 @@ def test_merge_drift_treats_whitespace_and_case_as_significant(catalog: Catalog)
     )
 
     out = tbl.scan().to_arrow()
-    rows = dict(zip(out.column("key").to_pylist(), out.column("value").to_pylist()))
+    rows = dict(zip(out.column("key").to_pylist(), out.column("value").to_pylist(), strict=True))
     assert rows["a"] == 99  # replaced
     assert rows[" a"] == 2  # untouched
     assert rows["a "] == 3  # untouched
@@ -2422,7 +2422,9 @@ def test_merge_preserves_nan_in_target_float_join_key(catalog: Catalog) -> None:
     )
 
     out = tbl.scan().to_arrow()
-    vals_by_key = {(k if k == k else "nan"): v for k, v in zip(out.column("key").to_pylist(), out.column("value").to_pylist())}
+    vals_by_key = {
+        (k if k == k else "nan"): v for k, v in zip(out.column("key").to_pylist(), out.column("value").to_pylist(), strict=True)
+    }
     assert vals_by_key[1.5] == 99  # replaced
     assert vals_by_key[2.5] == 3  # preserved (not in source key set)
     assert vals_by_key["nan"] == 2  # preserved
