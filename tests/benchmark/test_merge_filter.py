@@ -27,8 +27,9 @@ import gc
 import itertools
 import timeit
 import tracemalloc
+from collections.abc import Callable
 from pathlib import PosixPath
-from typing import Any, Callable
+from typing import Any
 
 import pyarrow as pa
 import pytest
