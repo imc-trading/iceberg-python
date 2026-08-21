@@ -23,7 +23,7 @@ import pytest
 from pyiceberg.catalog import Catalog
 from pyiceberg.exceptions import NoSuchTableError
 from pyiceberg.schema import Schema
-from pyiceberg.table import MergeResult, Table
+from pyiceberg.table import Table
 from pyiceberg.table.snapshots import Operation
 from pyiceberg.types import IntegerType, NestedField, StringType
 from tests.catalog.test_base import InMemoryCatalog
@@ -974,7 +974,7 @@ def test_merge_join_col_drift_single(catalog: Catalog, target_type: pa.DataType,
     assert out.num_rows == 3
     assert out.column("key").to_pylist() == [a, b, c]
     assert out.column("value").to_pylist() == [11, 2, 3]
-    assert result == MergeResult(rows_deleted=1, rows_inserted=2)
+    assert (result.rows_deleted, result.rows_inserted) == (1, 2)
 
 
 # ---- (2) Composite keys: drift on one col, multiple cols, mixed types ------
@@ -1308,7 +1308,7 @@ def test_merge_drift_all_source_keys_match(catalog: Catalog, target_type: pa.Dat
     out = tbl.scan().to_arrow().sort_by("key")
     assert out.num_rows == 2
     assert out.column("value").to_pylist() == [11, 22]
-    assert result == MergeResult(rows_deleted=2, rows_inserted=2)
+    assert (result.rows_deleted, result.rows_inserted) == (2, 2)
 
 
 @pytest.mark.parametrize(
@@ -1343,7 +1343,7 @@ def test_merge_drift_no_source_keys_match(catalog: Catalog, target_type: pa.Data
     out = tbl.scan().to_arrow().sort_by("key")
     assert out.num_rows == 4
     assert sorted(out.column("key").to_pylist()) == ["a", "b", "x", "y"]
-    assert result == MergeResult(rows_inserted=2)
+    assert (result.rows_deleted, result.rows_inserted) == (0, 2)
 
 
 # ---- (5) Edge values in join key (with drift) ------------------------------
@@ -1531,7 +1531,7 @@ def test_merge_result_counts_correct_with_drift(catalog: Catalog, target_type: p
         join_cols=["key"],
     )
 
-    assert result == MergeResult(rows_deleted=2, rows_inserted=3)
+    assert (result.rows_deleted, result.rows_inserted) == (2, 3)
     assert tbl.scan().to_arrow().num_rows == 5
 
 
@@ -1562,8 +1562,8 @@ def test_merge_drift_idempotent_when_reapplied(catalog: Catalog) -> None:
     r1 = tbl.merge(src, join_cols=["key"])
     r2 = tbl.merge(src, join_cols=["key"])
 
-    assert r1 == MergeResult(rows_deleted=1, rows_inserted=2)
-    assert r2 == MergeResult(rows_deleted=2, rows_inserted=2)  # second pass replaces both rows it inserted
+    assert (r1.rows_deleted, r1.rows_inserted) == (1, 2)
+    assert (r2.rows_deleted, r2.rows_inserted) == (2, 2)  # second pass replaces both rows it inserted
     out = tbl.scan().to_arrow().sort_by("key")
     assert out.num_rows == 3
     assert out.column("value").to_pylist() == [99, 2, 3]
@@ -1740,7 +1740,7 @@ def test_merge_drift_with_single_row_target_and_source(catalog: Catalog) -> None
         join_cols=["key"],
     )
 
-    assert result == MergeResult(rows_deleted=1, rows_inserted=1)
+    assert (result.rows_deleted, result.rows_inserted) == (1, 1)
     out = tbl.scan().to_arrow()
     assert out.num_rows == 1
     assert out.column("value").to_pylist() == [99]
@@ -2561,7 +2561,7 @@ def test_merge_result_empty_df(catalog: Catalog) -> None:
 
     result = tbl.merge(pa.Table.from_pylist([], schema=ARROW), join_cols=["user_id"])
 
-    assert result == MergeResult(rows_deleted=0, rows_inserted=0)
+    assert (result.rows_deleted, result.rows_inserted) == (0, 0)
     assert tbl.scan().to_arrow().num_rows == 3
 
 
@@ -2593,7 +2593,7 @@ def test_merge_result_no_overlap(catalog: Catalog) -> None:
         join_cols=["user_id"],
     )
 
-    assert result == MergeResult(rows_deleted=0, rows_inserted=2)
+    assert (result.rows_deleted, result.rows_inserted) == (0, 2)
     assert tbl.scan().to_arrow().num_rows == 5
 
 
@@ -2626,7 +2626,7 @@ def test_merge_result_full_overlap(catalog: Catalog) -> None:
         join_cols=["user_id"],
     )
 
-    assert result == MergeResult(rows_deleted=3, rows_inserted=3)
+    assert (result.rows_deleted, result.rows_inserted) == (3, 3)
     assert tbl.scan().to_arrow().num_rows == 3
 
 
@@ -2659,7 +2659,7 @@ def test_merge_result_partial_overlap(catalog: Catalog) -> None:
         join_cols=["user_id"],
     )
 
-    assert result == MergeResult(rows_deleted=2, rows_inserted=3)
+    assert (result.rows_deleted, result.rows_inserted) == (2, 3)
     assert tbl.scan().to_arrow().num_rows == 4
 
 
@@ -2690,7 +2690,7 @@ def test_merge_result_target_duplicates(catalog: Catalog) -> None:
         join_cols=["user_id"],
     )
 
-    assert result == MergeResult(rows_deleted=3, rows_inserted=1)
+    assert (result.rows_deleted, result.rows_inserted) == (3, 1)
     assert tbl.scan().to_arrow().num_rows == 1
 
 
@@ -2721,5 +2721,5 @@ def test_merge_result_source_duplicates(catalog: Catalog) -> None:
         join_cols=["user_id"],
     )
 
-    assert result == MergeResult(rows_deleted=1, rows_inserted=3)
+    assert (result.rows_deleted, result.rows_inserted) == (1, 3)
     assert tbl.scan().to_arrow().num_rows == 3
