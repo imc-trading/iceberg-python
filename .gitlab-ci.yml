@@ -1,0 +1,242 @@
+# Fork-only. This file does not exist upstream and must never reach a pull
+# request against apache/iceberg-python, which uses GitHub Actions.
+#
+# It lives in its own commit so that upstream contributions -- cherry-picked one
+# commit at a time onto `main` -- never pick it up. `main` tracks upstream
+# exactly and therefore carries no CI config, so branches cut from it get no
+# pipeline; pipelines exist precisely where this file does.
+
+image: docker-registry.trading.imc.intra/data_analytics_team/frostbyte/pyiceberg-ci:latest
+
+default:
+  tags:
+    - amer
+
+stages:
+  - check
+  - publish
+
+variables:
+  # Merging to this branch publishes a release. Rebasing it onto upstream
+  # rewrites every commit, so push those with `-o ci.skip` to avoid
+  # re-publishing the whole stack:
+  #   git rebase main && git push --force-with-lease -o ci.skip origin imc-main
+  RELEASE_BRANCH: imc-main
+  UV_PYTHON_VERSION: "3.12"
+  # Pre-release marker appended to the upstream version, so that an unpinned
+  # `pyiceberg` requirement never resolves to a fork build: pip and uv exclude
+  # pre-releases unless the requirement names one explicitly, while an exact pin
+  # to one is honoured without --pre. Consumers opt in with
+  # `pyiceberg==0.12.0.dev0+imc.N`.
+  #
+  # Set this to "" only to cut a *stable* fork release. That build would sort
+  # above every public pyiceberg release (a local version outranks the public
+  # version it decorates), making the fork the default for every internal
+  # consumer of an unpinned `pyiceberg`, not just those who asked for it.
+  PRERELEASE: ".dev0"
+
+workflow:
+  rules:
+    # `publish-fork` creates and pushes the release tag. Building tags would let
+    # that push start a second pipeline and publish the same commit again.
+    - if: $CI_COMMIT_TAG
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    # Suppress the duplicate branch pipeline while an MR is open for the branch.
+    - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS
+      when: never
+    - if: $CI_COMMIT_BRANCH
+    - if: $CI_PIPELINE_SOURCE == "web"
+
+.check:
+  stage: check
+  before_script:
+    - source ~/.bashrc || true
+    - uv --version
+
+lint:
+  extends: .check
+  script:
+    # This base lints with prek, not poetry + pre-commit; prek comes from the
+    # dev dependency group, which `uv sync` installs by default.
+    #
+    # `--frozen`, not `--locked`: the image ships uv 0.10.8, which reads
+    # uv.lock (revision 3) but considers it in need of an update, so --locked
+    # fails the job. --frozen installs exactly what the lock says and skips
+    # that check; lock freshness is asserted by the uv-lock hook below.
+    - uv sync --frozen --python "${UV_PYTHON_VERSION}"
+    - uv run prek run --all-files
+
+test:
+  extends: .check
+  script:
+    # Deliberately not `--all-extras`: that resolves bodo, daft and ray, none of
+    # which the unit suite exercises, and takes many minutes to do it. These are
+    # the extras the tests actually import. pytz is imported by
+    # tests/utils/test_datetime.py without being declared anywhere, so it comes
+    # in per-run via `--with` rather than polluting the synced environment.
+    - >
+      uv sync --frozen --python "${UV_PYTHON_VERSION}"
+      --extra pyarrow --extra pandas --extra pyiceberg-core --extra datafusion
+      --extra hive --extra s3fs --extra adlfs --extra gcsfs --extra entra-auth
+    # `python -m pytest` (not bare `pytest`) puts the repo root on sys.path,
+    # which the suite's `from tests.… import` lines need.
+    - uv run --with pytz python -m pytest tests/ -m "(unmarked or parametrize) and not integration"
+
+publish-fork:
+  stage: publish
+  interruptible: false
+  needs:
+    - job: lint
+    - job: test
+
+  rules:
+    - if: $CI_COMMIT_BRANCH == $RELEASE_BRANCH
+
+  variables:
+    # The +imc.N suffix is derived from existing tags, so the default shallow
+    # clone is not enough.
+    GIT_DEPTH: 0
+
+  retry:
+    max: 2
+    when:
+      - runner_system_failure
+
+  script:
+    - source ~/.bashrc || true
+
+    # The tag is pushed over SSH with the identity baked into the image (the
+    # same one the previous pipeline used), because CI_JOB_TOKEN grants read
+    # access only -- it has no write_repository permission. Prove the identity
+    # works before spending four minutes building wheels.
+    - git ls-remote --exit-code "git@${CI_SERVER_HOST}:${CI_PROJECT_PATH}.git" HEAD > /dev/null
+    - test -n "${PYPI_USERNAME:?must be set to the internal PyPI develop-repository user}"
+    - test -n "${PYPI_PASSWORD:?must be set to the internal PyPI develop-repository password}"
+    - test -n "${PYPI_PROD_USERNAME:?must be set to the internal PyPI prod-repository user}"
+    - test -n "${PYPI_PROD_PASSWORD:?must be set to the internal PyPI prod-repository password}"
+
+    - git fetch --tags
+
+    # find the upstream version this fork is built on
+    - |
+      UPSTREAM_VERSION=$(
+        sed -nE 's/^version = "([0-9]+\.[0-9]+\.[0-9]+)(\+imc\.[0-9]+)?"/\1/p' pyproject.toml
+      )
+
+    # compute the next SUFFIX by scanning existing fork tags. The glob includes
+    # the pre-release marker, so the .dev series and any stable series keep
+    # separate counters.
+    - |
+      suffixes=$(
+        git tag --list "pyiceberg-${UPSTREAM_VERSION}${PRERELEASE}+imc.*" \
+          | sed -E 's/.*\+imc\.([0-9]+)$/\1/' \
+          | sort -n
+      )
+      if [ -z "$suffixes" ]; then
+        SUFFIX=0
+      else
+        last=$(echo "$suffixes" | tail -n1)
+        SUFFIX=$(( last + 1 ))
+      fi
+      FORK_VERSION="${UPSTREAM_VERSION}${PRERELEASE}+imc.${SUFFIX}"
+      echo "FORK VERSION is ${FORK_VERSION}"
+      echo "${FORK_VERSION}" > fork_version.txt
+
+    # tag the released commit
+    - FORK_TAG="pyiceberg-$(cat fork_version.txt)"
+    - git config user.name "GitLab CI"
+    - git config user.email "noreply@imc.com"
+    - git tag -a "${FORK_TAG}" -m "IMC fork of pyiceberg -> ${FORK_TAG}"
+    - git push "git@${CI_SERVER_HOST}:${CI_PROJECT_PATH}.git" "${FORK_TAG}"
+
+    # update pyproject.toml to the forked version
+    - sed -i 's/^version = ".*"/version = "'"$(cat fork_version.txt)"'"/' pyproject.toml
+
+    # build + publish the fork. pyiceberg/avro/decoder_fast.pyx makes these
+    # wheels ABI-specific, so one per supported interpreter.
+    - for version in 3.12 3.11 3.10; do uv build --python $version --wheel; done
+    - uv build --sdist
+    - |
+      UV_PUBLISH_USERNAME="${PYPI_USERNAME}" \
+      UV_PUBLISH_PASSWORD="${PYPI_PASSWORD}" \
+      UV_PUBLISH_URL="http://imc-pypi-repo.trading.imc.intra/repository/develop/" \
+      uv publish
+    - |
+      UV_PUBLISH_USERNAME="${PYPI_PROD_USERNAME}" \
+      UV_PUBLISH_PASSWORD="${PYPI_PROD_PASSWORD}" \
+      UV_PUBLISH_URL="http://imc-pypi-repo.trading.imc.intra/repository/prod/" \
+      uv publish
+
+  artifacts:
+    paths:
+      - fork_version.txt
+    expire_in: 1h
+
+publish-wrapper:
+  stage: publish
+  interruptible: false
+
+  needs:
+    - job: publish-fork
+      artifacts: true
+
+  rules:
+    - if: $CI_COMMIT_BRANCH == $RELEASE_BRANCH
+
+  retry:
+    max: 2
+    when:
+      - runner_system_failure
+
+  script:
+    - source ~/.bashrc || true
+
+    - test -n "${PYPI_USERNAME:?must be set to the internal PyPI develop-repository user}"
+    - test -n "${PYPI_PASSWORD:?must be set to the internal PyPI develop-repository password}"
+    - test -n "${PYPI_PROD_USERNAME:?must be set to the internal PyPI prod-repository user}"
+    - test -n "${PYPI_PROD_PASSWORD:?must be set to the internal PyPI prod-repository password}"
+
+    # read FORK_VERSION (X.Y.Z+imc.N) from publish-fork
+    - FORK_VERSION=$(cat fork_version.txt)
+
+    # The wrapper carries the fork version verbatim. The old X.Y.Z.N form cannot
+    # express a pre-release -- "0.12.0.dev0" + ".3" is not a valid PEP 440
+    # version -- and mirroring keeps the two names trivially correlatable.
+    - WRAPPER_VERSION="${FORK_VERSION}"
+    - echo "WRAPPER version is ${WRAPPER_VERSION}"
+
+    # create minimal wrapper imc-pyiceberg
+    - mkdir imc-pyiceberg && cd imc-pyiceberg
+    - uv venv --python "${UV_PYTHON_VERSION}" && source ./.venv/bin/activate
+    - uv pip install "setuptools>=69.6.1"
+    - |
+      cat > pyproject.toml <<EOF
+      [project]
+      name = "imc-pyiceberg"
+      version = "${WRAPPER_VERSION}"
+      dependencies = ["pyiceberg==${FORK_VERSION}"]
+
+      [project.optional-dependencies]
+      hive         = ["pyiceberg[hive]==${FORK_VERSION}"]
+      pyarrow      = ["pyiceberg[pyarrow]==${FORK_VERSION}"]
+      duckdb       = ["pyiceberg[duckdb]==${FORK_VERSION}"]
+      s3fs         = ["pyiceberg[s3fs]==${FORK_VERSION}"]
+      gcsfs        = ["pyiceberg[gcsfs]==${FORK_VERSION}"]
+      sql-postgres = ["pyiceberg[sql-postgres]==${FORK_VERSION}"]
+      sql-sqlite   = ["pyiceberg[sql-sqlite]==${FORK_VERSION}"]
+      EOF
+
+    # build + publish
+    - for version in 3.12 3.11 3.10; do uv build --python $version --wheel; done
+    - uv build --sdist
+    - |
+      UV_PUBLISH_USERNAME="${PYPI_USERNAME}" \
+      UV_PUBLISH_PASSWORD="${PYPI_PASSWORD}" \
+      UV_PUBLISH_URL="http://imc-pypi-repo.trading.imc.intra/repository/develop/" \
+      uv publish
+    - |
+      UV_PUBLISH_USERNAME="${PYPI_PROD_USERNAME}" \
+      UV_PUBLISH_PASSWORD="${PYPI_PROD_PASSWORD}" \
+      UV_PUBLISH_URL="http://imc-pypi-repo.trading.imc.intra/repository/prod/" \
+      uv publish
